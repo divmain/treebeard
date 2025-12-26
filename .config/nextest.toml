@@ -1,0 +1,33 @@
+[profile.default]
+# Run tests serially (one at a time) to avoid filesystem contention
+# Each test still runs in its own process for FUSE isolation
+test-threads = 1
+
+# FUSE tests need longer timeouts
+slow-timeout = { period = "15s", terminate-after = 2 }
+
+# Don't stop on first failure - run all tests
+fail-fast = false
+
+# Retry flaky tests (FUSE tests can be timing-sensitive)
+retries = 1
+
+[profile.ci]
+# CI profile inherits from default
+test-threads = 1
+fail-fast = false
+slow-timeout = { period = "120s", terminate-after = 2 }
+retries = 2
+
+# Per-test overrides for proptest tests that run multiple FUSE iterations
+[[profile.default.overrides]]
+filter = "test(test_ec_rapid_successive_changes)"
+slow-timeout = { period = "30s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+filter = "test(test_ec_special_char_filenames)"
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "test(test_ec_filename_with_spaces_and_underscores)"
+slow-timeout = { period = "30s", terminate-after = 2 }
