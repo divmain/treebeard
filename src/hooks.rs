@@ -96,13 +96,19 @@ fn shell_escape(s: &str) -> String {
 pub fn expand_template(template: &str, context: &HookContext) -> String {
     let mut result = template.to_string();
 
-    result = result.replace("{{branch}}", &context.branch);
-    result = result.replace("{{mount_path}}", &context.mount_path.to_string_lossy());
+    result = result.replace("{{branch}}", &shell_escape(&context.branch));
+    result = result.replace(
+        "{{mount_path}}",
+        &shell_escape(&context.mount_path.to_string_lossy()),
+    );
     result = result.replace(
         "{{worktree_path}}",
-        &context.worktree_path.to_string_lossy(),
+        &shell_escape(&context.worktree_path.to_string_lossy()),
     );
-    result = result.replace("{{repo_path}}", &context.repo_path.to_string_lossy());
+    result = result.replace(
+        "{{repo_path}}",
+        &shell_escape(&context.repo_path.to_string_lossy()),
+    );
 
     let diff_value = context.diff.as_deref().unwrap_or("");
     // Shell-escape the diff content to prevent injection attacks
@@ -324,6 +330,56 @@ mod tests {
         assert_eq!(shell_escape("it's"), "it'\\''s");
         assert_eq!(shell_escape("'quoted'"), "'\\''quoted'\\''");
         assert_eq!(shell_escape("no quotes here"), "no quotes here");
+    }
+
+    #[test]
+    fn test_expand_template_branch_escapes_shell_injection() {
+        // Verify that shell command injection through branch names is prevented
+        let ctx = HookContext {
+            branch: "test'; rm -rf /; echo '".to_string(),
+            mount_path: PathBuf::from("/mounts/repo"),
+            worktree_path: PathBuf::from("/worktrees/repo"),
+            repo_path: PathBuf::from("/repos/myrepo"),
+            diff: None,
+        };
+        let result = expand_template("echo {{branch}}", &ctx);
+        // The single quotes in the branch name should be escaped
+        assert_eq!(result, "echo test'\\''; rm -rf /; echo '\\''");
+    }
+
+    #[test]
+    fn test_expand_template_mount_path_escapes_shell_injection() {
+        // Verify that shell command injection through mount_path is prevented
+        let ctx = HookContext {
+            branch: "feature".to_string(),
+            mount_path: PathBuf::from("/mounts/test'; rm -rf /; echo '"),
+            worktree_path: PathBuf::from("/worktrees/repo"),
+            repo_path: PathBuf::from("/repos/myrepo"),
+            diff: None,
+        };
+        let result = expand_template("cd {{mount_path}}", &ctx);
+        // The single quotes in the path should be escaped
+        assert_eq!(result, "cd /mounts/test'\\''; rm -rf /; echo '\\''");
+    }
+
+    #[test]
+    fn test_expand_template_all_paths_escaped() {
+        // Verify all template variables are properly escaped
+        let ctx = HookContext {
+            branch: "test'branch".to_string(),
+            mount_path: PathBuf::from("/path'with'quotes"),
+            worktree_path: PathBuf::from("/worktree'test"),
+            repo_path: PathBuf::from("/repo'path"),
+            diff: None,
+        };
+        let result = expand_template(
+            "echo {{branch}} {{mount_path}} {{worktree_path}} {{repo_path}}",
+            &ctx,
+        );
+        assert_eq!(
+            result,
+            "echo test'\\''branch /path'\\''with'\\''quotes /worktree'\\''test /repo'\\''path"
+        );
     }
 
     #[test]
