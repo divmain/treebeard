@@ -866,7 +866,7 @@ impl Filesystem for TreebeardFs {
             }
         };
 
-        let Some((rel_path, layer, has_open)) = self.get_inode_info(ino) else {
+        let Some((rel_path, layer, _has_open)) = self.get_inode_info(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
@@ -879,104 +879,11 @@ impl Filesystem for TreebeardFs {
                 .insert(rel_path.clone(), MutationType::Deleted);
         }
 
-        {
-            let mut inodes = self.inodes.write();
-            inodes.remove_child(parent, name);
-            if let Some(inode) = inodes.get_mut(ino) {
-                inode.hardlinks = inode.hardlinks.saturating_sub(1);
-                inode.attrs.nlink = inode.attrs.nlink.saturating_sub(1); // Keep attrs.nlink in sync
-            }
-        }
-
-        if is_passthrough {
-            // Passthrough files are deleted directly from lower layer
-            let lower_path = self.lower_layer.join(&rel_path);
-            if let Err(e) = fs::remove_file(lower_path) {
-                reply.error(io_error_to_libc(&e));
-                return;
-            }
-        } else {
-            match layer {
-                LayerType::Upper => {
-                    if has_open {
-                        self.deleted.write().insert(ino);
-                    } else {
-                        self.do_delete(ino);
-                    }
-                }
-                LayerType::Lower => {
-                    if let Err(e) = self.create_whiteout(parent, name) {
-                        reply.error(e);
-                        return;
-                    }
-                }
-            }
-
-            // Signal that a file was deleted
-            self.signal_mutation(&rel_path);
-        }
-
-        reply.ok();
+        self.do_remove(parent, name, reply, std::fs::remove_file);
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let lookup_result = {
-            let inodes = self.inodes.read();
-            inodes.lookup_child(parent, name)
-        };
-        let ino = match lookup_result {
-            Some(ino) => ino,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
-        let Some((dir_path, layer, has_open)) = self.get_inode_info(ino) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-
-        let is_passthrough = self.is_passthrough(&dir_path);
-
-        {
-            let mut inodes = self.inodes.write();
-            inodes.remove_child(parent, name);
-            if let Some(inode) = inodes.get_mut(ino) {
-                inode.hardlinks = inode.hardlinks.saturating_sub(1);
-                inode.attrs.nlink = inode.attrs.nlink.saturating_sub(1); // Keep attrs.nlink in sync
-            }
-        }
-
-        if is_passthrough {
-            // Passthrough directories are deleted directly from lower layer
-            let lower_path = self.lower_layer.join(&dir_path);
-            if let Err(e) = fs::remove_dir(lower_path) {
-                reply.error(io_error_to_libc(&e));
-                return;
-            }
-        } else {
-            match layer {
-                LayerType::Upper => {
-                    if has_open {
-                        self.deleted.write().insert(ino);
-                    } else {
-                        self.do_delete(ino);
-                    }
-                }
-                LayerType::Lower => {
-                    if let Err(e) = self.create_whiteout(parent, name) {
-                        reply.error(e);
-                        return;
-                    }
-                }
-            }
-
-            // Signal that a directory was removed
-            self.signal_mutation(&dir_path);
-        }
-
-        reply.ok();
+        self.do_remove(parent, name, reply, std::fs::remove_dir);
     }
 
     fn rename(

@@ -763,6 +763,74 @@ impl TreebeardFs {
             entries.insert(name, (child_ino, file_type, layer));
         }
     }
+
+    pub(crate) fn do_remove<F>(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+        reply: fuser::ReplyEmpty,
+        remove_fn: F,
+    ) where
+        F: FnOnce(PathBuf) -> std::io::Result<()>,
+    {
+        use crate::overlay::convert::io_error_to_libc;
+
+        let lookup_result = {
+            let inodes = self.inodes.read();
+            inodes.lookup_child(parent, name)
+        };
+        let ino = match lookup_result {
+            Some(ino) => ino,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let Some((path, layer, has_open)) = self.get_inode_info(ino) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        let is_passthrough = self.is_passthrough(&path);
+
+        {
+            let mut inodes = self.inodes.write();
+            inodes.remove_child(parent, name);
+            if let Some(inode) = inodes.get_mut(ino) {
+                inode.hardlinks = inode.hardlinks.saturating_sub(1);
+                inode.attrs.nlink = inode.attrs.nlink.saturating_sub(1);
+            }
+        }
+
+        if is_passthrough {
+            let lower_path = self.lower_layer.join(&path);
+            if let Err(e) = remove_fn(lower_path) {
+                reply.error(io_error_to_libc(&e));
+                return;
+            }
+        } else {
+            match layer {
+                LayerType::Upper => {
+                    if has_open {
+                        self.deleted.write().insert(ino);
+                    } else {
+                        self.do_delete(ino);
+                    }
+                }
+                LayerType::Lower => {
+                    if let Err(e) = self.create_whiteout(parent, name) {
+                        reply.error(e);
+                        return;
+                    }
+                }
+            }
+
+            self.signal_mutation(&path);
+        }
+
+        reply.ok();
+    }
 }
 
 #[cfg(test)]
