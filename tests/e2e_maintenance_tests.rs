@@ -1,10 +1,10 @@
 mod common;
 mod e2e_helpers;
+mod fuse_common;
 
-use common::{
-    cleanup_all_test_mounts, count_treebeard_mounts, get_treebeard_mount_paths, TestWorkspace,
-};
+use common::TestWorkspace;
 use e2e_helpers::{spawn_treebeard_test_mode, terminate_treebeard};
+use fuse_common::{cleanup_all_test_mounts, count_treebeard_mounts, get_treebeard_mount_paths};
 use std::thread;
 use std::time::Duration;
 

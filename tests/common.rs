@@ -173,111 +173,37 @@ impl TestWorkspace {
     /// This can be used by tests to verify cleanup worked correctly.
     pub fn verify_mount_cleaned_up(&self, branch_name: &str) -> bool {
         let mount_path = self.get_mount_path(branch_name);
-        !is_mount_active(&mount_path)
+        !self.is_mount_active_impl(&mount_path)
     }
 }
 
-/// Check if a path is currently an active mount point.
 #[allow(dead_code)]
-pub fn is_mount_active(path: &Path) -> bool {
-    let mount_output = match Command::new("mount").output() {
-        Ok(output) => output,
-        Err(_) => return false,
-    };
+impl TestWorkspace {
+    fn is_mount_active_impl(&self, path: &Path) -> bool {
+        let mount_output = match Command::new("mount").output() {
+            Ok(output) => output,
+            Err(_) => return false,
+        };
 
-    let mount_text = String::from_utf8_lossy(&mount_output.stdout);
-    let path_str = path.to_string_lossy();
+        let mount_text = String::from_utf8_lossy(&mount_output.stdout);
+        let path_str = path.to_string_lossy();
 
-    for line in mount_text.lines() {
-        if line.contains("treebeard") {
-            if let Some(start) = line.find(" on ") {
-                let after_on = &line[start + 4..];
-                if let Some(end) = after_on.find(" (") {
-                    let mount_path = &after_on[..end];
-                    if mount_path == path_str {
-                        return true;
+        for line in mount_text.lines() {
+            if line.contains("treebeard") {
+                if let Some(start) = line.find(" on ") {
+                    let after_on = &line[start + 4..];
+                    if let Some(end) = after_on.find(" (") {
+                        let mount_path = &after_on[..end];
+                        if mount_path == path_str {
+                            return true;
+                        }
                     }
                 }
             }
         }
+
+        false
     }
-
-    false
-}
-
-/// Count the number of active treebeard FUSE mounts.
-#[allow(dead_code)]
-pub fn count_treebeard_mounts() -> usize {
-    let mount_output = match Command::new("mount").output() {
-        Ok(output) => output,
-        Err(_) => return 0,
-    };
-
-    let mount_text = String::from_utf8_lossy(&mount_output.stdout);
-    mount_text
-        .lines()
-        .filter(|line| line.contains("treebeard"))
-        .count()
-}
-
-/// Get all active treebeard mount paths.
-#[allow(dead_code)]
-pub fn get_treebeard_mount_paths() -> Vec<String> {
-    let mount_output = match Command::new("mount").output() {
-        Ok(output) => output,
-        Err(_) => return Vec::new(),
-    };
-
-    let mount_text = String::from_utf8_lossy(&mount_output.stdout);
-    let mut paths = Vec::new();
-
-    for line in mount_text.lines() {
-        if !line.contains("treebeard") {
-            continue;
-        }
-
-        if let Some(start) = line.find(" on ") {
-            let after_on = &line[start + 4..];
-            if let Some(end) = after_on.find(" (") {
-                let mount_path = &after_on[..end];
-                paths.push(mount_path.to_string());
-            }
-        }
-    }
-
-    paths
-}
-
-/// Force unmount all treebeard mounts in temp directories.
-///
-/// This is a cleanup function that can be used to clean up stale mounts
-/// from crashed tests. It only unmounts mounts in /private/var/folders
-/// or /tmp to avoid accidentally unmounting production mounts.
-#[allow(dead_code)]
-pub fn cleanup_all_test_mounts() -> usize {
-    let paths = get_treebeard_mount_paths();
-    let mut cleaned = 0;
-
-    for path in paths {
-        // Only clean up mounts in temp directories (test mounts)
-        if path.contains("/var/folders/")
-            || path.contains("/tmp/")
-            || path.contains("/private/var/folders/")
-        {
-            eprintln!("Cleaning up stale test mount: {}", path);
-            let result = Command::new("diskutil")
-                .args(["unmount", "force", &path])
-                .output();
-
-            if let Ok(output) = result {
-                if output.status.success() {
-                    cleaned += 1;
-                }
-            }
-        }
-    }
-
-    cleaned
 }
 
 /// A lighter-weight test context that only sets up an isolated config directory.
