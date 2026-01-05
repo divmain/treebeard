@@ -31,8 +31,9 @@ pub fn load_active_sessions() -> Result<Vec<ActiveSession>> {
     let result = serde_json::from_str::<Vec<ActiveSession>>(&content)
         .map_err(|e| TreebeardError::Config(format!("Failed to parse session state: {}", e)));
 
-    file.unlock()
-        .map_err(|e| TreebeardError::Config(format!("Failed to release read lock: {}", e)))?;
+    if let Err(e) = file.unlock() {
+        tracing::warn!("Failed to release read lock: {}", e);
+    }
 
     result
 }
@@ -62,8 +63,9 @@ pub fn save_active_sessions(sessions: &[ActiveSession]) -> Result<()> {
     std::fs::write(&sessions_path, content)
         .map_err(|e| TreebeardError::Config(format!("Failed to write session state: {}", e)))?;
 
-    file.unlock()
-        .map_err(|e| TreebeardError::Config(format!("Failed to release write lock: {}", e)))?;
+    if let Err(e) = file.unlock() {
+        tracing::warn!("Failed to release write lock: {}", e);
+    }
 
     Ok(())
 }
