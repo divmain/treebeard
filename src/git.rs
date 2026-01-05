@@ -383,20 +383,42 @@ impl GitRepo {
                 .current_dir(&self.workdir)
                 .output();
 
-            if let Err(e) = rollback_result {
-                tracing::error!("Failed to rollback HEAD after commit failure: {:?}", e);
-            }
-
             let stderr = String::from_utf8_lossy(&commit_output.stderr);
             let error_msg = if stderr.trim().is_empty() {
                 String::from_utf8_lossy(&commit_output.stdout).to_string()
             } else {
                 stderr.to_string()
             };
-            return Err(TreebeardError::Git(format!(
+
+            let original_error = TreebeardError::Git(format!(
                 "Failed to create squash commit: {}",
                 error_msg.trim()
-            )));
+            ));
+
+            match rollback_result {
+                Ok(ref rollback) if rollback.status.success() => {}
+                Ok(ref rollback) => {
+                    let rollback_stderr = String::from_utf8_lossy(&rollback.stderr);
+                    let rollback_error = if rollback_stderr.trim().is_empty() {
+                        String::from_utf8_lossy(&rollback.stdout).to_string()
+                    } else {
+                        rollback_stderr.to_string()
+                    };
+                    return Err(TreebeardError::Git(format!(
+                        "{}\n\nCRITICAL: Rollback also failed: {}. Repository may be in inconsistent state!",
+                        original_error,
+                        rollback_error.trim()
+                    )));
+                }
+                Err(e) => {
+                    return Err(TreebeardError::Git(format!(
+                        "{}\n\nCRITICAL: Failed to execute rollback: {}. Repository may be in inconsistent state!",
+                        original_error, e
+                    )));
+                }
+            }
+
+            return Err(original_error);
         }
 
         Ok(())
