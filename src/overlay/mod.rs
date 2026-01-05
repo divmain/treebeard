@@ -349,18 +349,30 @@ impl Filesystem for TreebeardFs {
     ///
     /// # Concurrent Open/Copy-Up Semantics
     ///
-    /// When multiple threads open the same file concurrently, they may see different
-    /// layer states. For example:
-    /// 1. Thread A opens file for read-only -> file stays in Lower layer
-    /// 2. Thread B opens same file for write -> triggers copy-up to Upper layer
-    /// 3. Thread A reads from Lower, Thread B writes to Upper -> they see different data
+    /// This function acquires a copy-up lock for the inode and holds it through
+    /// the entire operation to prevent race conditions between checking the layer
+    /// and opening the file. This ensures that no other thread can delete or
+    /// modify the file between the layer check and the file open.
     ///
-    /// This is by design for overlay filesystem semantics. The copy-up operation
-    /// is atomic per-file, but concurrent opens are not serialized against each other.
-    /// This matches the behavior of other overlay filesystems like overlayfs.
+    /// When multiple threads open the same file concurrently, they may see different
+    /// layer states. However, the copy-up operation is atomic per-file and the lock
+    /// ensures consistency during the open sequence.
     fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         tracing::debug!("open(ino={}, flags={:#x})", ino, flags);
-        let (_rel_path, layer) = {
+
+        // Acquire the copy-up lock for this inode before checking the layer.
+        // This prevents race conditions where another thread could delete or
+        // modify the file between the layer check and the file open.
+        use std::sync::Arc;
+        let copy_up_lock = {
+            let mut locks = self.copy_up_locks.write();
+            locks
+                .entry(ino)
+                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+                .clone()
+        };
+
+        let layer = {
             let inodes = self.inodes.read();
             let inode = inodes.peek(ino);
             match inode {
@@ -371,7 +383,7 @@ impl Filesystem for TreebeardFs {
                         i.path,
                         i.layer
                     );
-                    (i.path.clone(), i.layer)
+                    i.layer
                 }
                 None => {
                     tracing::warn!("open: inode {} not found in table", ino);
@@ -387,16 +399,44 @@ impl Filesystem for TreebeardFs {
         tracing::debug!("open: wants_write={}", wants_write);
 
         // If file is in lower layer and write access is requested, do COW first
-        if layer == LayerType::Lower && wants_write && !self.is_passthrough(&_rel_path) {
-            tracing::debug!("open: performing copy-up for write access");
-            if let Err(e) = self.copy_up(ino) {
+        if layer == LayerType::Lower && wants_write {
+            let _copy_up_guard = copy_up_lock.lock();
+            if let Err(e) = self.copy_up_internal(ino) {
                 tracing::error!("open: copy-up failed with error {}", e);
                 reply.error(e);
                 return;
             }
         }
 
-        // Get the updated layer after potential copy-up
+        // Acquire the lock again to protect the file open operation
+        let _copy_up_guard = copy_up_lock.lock();
+
+        // Re-read the inode to get updated information
+        let (rel_path, _current_layer) = {
+            let inodes = self.inodes.read();
+            let inode = inodes.peek(ino);
+            match inode {
+                Some(i) => {
+                    tracing::debug!(
+                        "open: re-read inode {} -> path={:?}, layer={:?}",
+                        ino,
+                        i.path,
+                        i.layer
+                    );
+                    (i.path.clone(), i.layer)
+                }
+                None => {
+                    tracing::warn!("open: inode {} not found in table", ino);
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            }
+        };
+
+        // Check if passthrough for this file
+        let is_passthrough = self.is_passthrough(&rel_path);
+
+        // Get the actual path and verify the current layer (in case copy_up changed it)
         let (actual_path, current_layer) = {
             let inodes = self.inodes.read();
             let inode = inodes.peek(ino);
@@ -436,7 +476,7 @@ impl Filesystem for TreebeardFs {
         // For lower layer files (read-only), only allow read access
         // UNLESS it's a passthrough file, in which case we allow write to lower layer
         let (can_read, can_write) = match current_layer {
-            LayerType::Lower => (true, self.is_passthrough(&_rel_path)),
+            LayerType::Lower => (true, is_passthrough),
             LayerType::Upper => (true, true),
         };
 

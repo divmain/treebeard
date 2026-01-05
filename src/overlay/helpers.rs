@@ -38,30 +38,17 @@ impl TreebeardFs {
         Ok(())
     }
 
-    pub(crate) fn copy_up(&mut self, ino: u64) -> Result<u64, i32> {
-        use std::sync::Arc;
-
-        let lock = {
-            let mut locks = self.copy_up_locks.write();
-            locks
-                .entry(ino)
-                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
-                .clone()
-        };
-
-        let _guard = lock.lock();
-
-        let cleanup_lock_after_guard = || {
-            drop(_guard);
-            self.copy_up_locks.write().remove(&ino);
-        };
-
+    /// Internal copy-up implementation that assumes the caller is already holding
+    /// the copy-up lock for this inode. Does not acquire or release the lock.
+    ///
+    /// This is used by `open()` which holds the lock through the entire operation
+    /// to prevent race conditions between checking the layer and opening the file.
+    pub(crate) fn copy_up_internal(&mut self, ino: u64) -> Result<(), i32> {
         {
             let inodes = self.inodes.read();
             if let Some(inode) = inodes.peek(ino) {
                 if inode.layer == LayerType::Upper {
-                    cleanup_lock_after_guard();
-                    return Ok(ino);
+                    return Ok(());
                 }
             }
         }
@@ -88,14 +75,11 @@ impl TreebeardFs {
                         .is_some_and(|inode| inode.layer == LayerType::Upper)
                 };
                 if is_in_upper {
-                    cleanup_lock_after_guard();
-                    return Ok(ino);
+                    return Ok(());
                 }
-                cleanup_lock_after_guard();
                 return Err(libc::ENOENT);
             }
             Err(_e) => {
-                cleanup_lock_after_guard();
                 return Err(libc::EIO);
             }
         };
@@ -129,7 +113,6 @@ impl TreebeardFs {
                         for created in created_dirs.iter().rev() {
                             let _ = fs::remove_dir(created);
                         }
-                        cleanup_lock_after_guard();
                         return Err(libc::EIO);
                     }
                 } else {
@@ -152,13 +135,11 @@ impl TreebeardFs {
             if let Err(e) = fs::create_dir(&dest_path) {
                 if e.kind() != io::ErrorKind::AlreadyExists {
                     cleanup_on_error(&created_dirs, &dest_path);
-                    cleanup_lock_after_guard();
                     return Err(libc::EIO);
                 }
             }
         } else if let Err(_e) = Self::clone_file_optimized(&src_path, &dest_path) {
             cleanup_on_error(&created_dirs, &dest_path);
-            cleanup_lock_after_guard();
             return Err(libc::EIO);
         }
 
@@ -166,7 +147,6 @@ impl TreebeardFs {
             Ok(m) => m,
             Err(_e) => {
                 cleanup_on_error(&created_dirs, &dest_path);
-                cleanup_lock_after_guard();
                 return Err(libc::EIO);
             }
         };
@@ -186,7 +166,27 @@ impl TreebeardFs {
                 .insert(src_info.0, MutationType::CopiedUp);
         }
 
-        cleanup_lock_after_guard();
+        Ok(())
+    }
+
+    pub(crate) fn copy_up(&mut self, ino: u64) -> Result<u64, i32> {
+        use std::sync::Arc;
+
+        let lock = {
+            let mut locks = self.copy_up_locks.write();
+            locks
+                .entry(ino)
+                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = lock.lock();
+
+        self.copy_up_internal(ino)?;
+
+        // Clean up the lock after successful copy-up
+        self.copy_up_locks.write().remove(&ino);
+
         Ok(ino)
     }
 
