@@ -182,8 +182,11 @@ pub fn unmount_fuse(mount_path: &Path) -> Result<bool> {
     validate_mount_path(mount_path)?;
 
     let unmount_result = if cfg!(target_os = "macos") {
+        let path_str = mount_path.to_str().ok_or_else(|| {
+            TreebeardError::Config("Mount path contains invalid UTF-8".to_string())
+        })?;
         std::process::Command::new("diskutil")
-            .args(["unmount", "force", mount_path.to_str().unwrap()])
+            .args(["unmount", "force", path_str])
             .status()
     } else {
         std::process::Command::new("umount")
