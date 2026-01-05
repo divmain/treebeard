@@ -372,53 +372,13 @@ impl Filesystem for TreebeardFs {
                 .clone()
         };
 
-        let layer = {
+        let (rel_path, layer) = {
             let inodes = self.inodes.read();
             let inode = inodes.peek(ino);
             match inode {
                 Some(i) => {
                     tracing::debug!(
                         "open: inode {} -> path={:?}, layer={:?}",
-                        ino,
-                        i.path,
-                        i.layer
-                    );
-                    i.layer
-                }
-                None => {
-                    tracing::warn!("open: inode {} not found in table", ino);
-                    reply.error(libc::ENOENT);
-                    return;
-                }
-            }
-        };
-
-        // Determine if write access is requested
-        // Note: O_RDONLY is 0, so we check if it's NOT read-only
-        let wants_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
-        tracing::debug!("open: wants_write={}", wants_write);
-
-        // If file is in lower layer and write access is requested, do COW first
-        if layer == LayerType::Lower && wants_write {
-            let _copy_up_guard = copy_up_lock.lock();
-            if let Err(e) = self.copy_up_internal(ino) {
-                tracing::error!("open: copy-up failed with error {}", e);
-                reply.error(e);
-                return;
-            }
-        }
-
-        // Acquire the lock again to protect the file open operation
-        let _copy_up_guard = copy_up_lock.lock();
-
-        // Re-read the inode to get updated information
-        let (rel_path, _current_layer) = {
-            let inodes = self.inodes.read();
-            let inode = inodes.peek(ino);
-            match inode {
-                Some(i) => {
-                    tracing::debug!(
-                        "open: re-read inode {} -> path={:?}, layer={:?}",
                         ino,
                         i.path,
                         i.layer
@@ -433,8 +393,27 @@ impl Filesystem for TreebeardFs {
             }
         };
 
-        // Check if passthrough for this file
+        // Determine if write access is requested
+        // Note: O_RDONLY is 0, so we check if it's NOT read-only
+        let wants_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
+        tracing::debug!("open: wants_write={}", wants_write);
+
+        // Check if this is a passthrough file (writes go directly to lower layer, no copy-up)
         let is_passthrough = self.is_passthrough(&rel_path);
+
+        // If file is in lower layer and write access is requested, do COW first
+        // (but NOT for passthrough files, which write directly to lower layer)
+        if layer == LayerType::Lower && wants_write && !is_passthrough {
+            let _copy_up_guard = copy_up_lock.lock();
+            if let Err(e) = self.copy_up_internal(ino) {
+                tracing::error!("open: copy-up failed with error {}", e);
+                reply.error(e);
+                return;
+            }
+        }
+
+        // Acquire the lock again to protect the file open operation
+        let _copy_up_guard = copy_up_lock.lock();
 
         // Get the actual path and verify the current layer (in case copy_up changed it)
         let (actual_path, current_layer) = {
