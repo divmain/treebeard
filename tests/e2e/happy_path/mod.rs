@@ -1,0 +1,12 @@
+mod branch_creation;
+mod cleanup_lifecycle;
+mod config_commands;
+mod doctor_diagnostics;
+mod file_operations;
+mod fuse_overlay;
+mod list_output;
+mod path_commands;
+mod session_management;
+mod subcommand_execution;
+mod sync_flow;
+mod workflows;
