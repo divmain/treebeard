@@ -55,11 +55,13 @@ impl InodeManager {
     ///
     /// This is the common lookup pattern used throughout FUSE callbacks.
     /// Returns `(path, layer, has_open_handles)` if the inode exists, or `None` otherwise.
-    pub fn get_inode_info(&self, ino: u64) -> Option<(PathBuf, LayerType, bool)> {
+    ///
+    /// The path is returned as `Arc<PathBuf>` to make cloning cheap in hot paths.
+    pub fn get_inode_info(&self, ino: u64) -> Option<(Arc<PathBuf>, LayerType, bool)> {
         let inodes = self.inodes.read();
         inodes
             .peek(ino)
-            .map(|i| (i.path.clone(), i.layer, i.open_file_handles > 0))
+            .map(|i| (Arc::clone(&i.path), i.layer, i.open_file_handles > 0))
     }
 
     /// Check if an inode exists and is in the upper layer.
@@ -91,7 +93,7 @@ impl InodeManager {
         let mut inodes = self.inodes.write();
         if let Some(inode) = inodes.get_mut(ino) {
             inode.layer = LayerType::Upper;
-            inode.path = path;
+            inode.path = Arc::new(path);
             inode.attrs = attrs;
         }
     }
@@ -176,7 +178,7 @@ impl InodeManager {
         inodes.remove_child(old_parent, old_name);
         inodes.add_child(new_parent, new_name.clone(), ino);
         if let Some(inode) = inodes.get_mut(ino) {
-            inode.path = new_path;
+            inode.path = Arc::new(new_path);
             inode.parent = new_parent;
             inode.name = new_name;
             inode.layer = layer;
@@ -247,7 +249,7 @@ impl InodeManager {
             parent,
             name,
             layer,
-            path,
+            path: Arc::new(path),
             attrs,
             open_file_handles: 0,
             hardlinks: if attrs.kind == FileType::Directory {
@@ -267,9 +269,11 @@ impl InodeManager {
 
     /// Get the path for a given inode.
     /// Returns None if the inode doesn't exist.
-    pub fn get_path(&self, ino: u64) -> Option<PathBuf> {
+    ///
+    /// The path is returned as `Arc<PathBuf>` to make cloning cheap in hot paths.
+    pub fn get_path(&self, ino: u64) -> Option<Arc<PathBuf>> {
         let inodes = self.inodes.read();
-        inodes.peek(ino).map(|i| i.path.clone())
+        inodes.peek(ino).map(|i| Arc::clone(&i.path))
     }
 
     /// Get the layer for a given inode.
@@ -347,7 +351,7 @@ mod tests {
         let info = manager.get_inode_info(100);
         assert!(info.is_some());
         let (path, layer, has_open) = info.unwrap();
-        assert_eq!(path, PathBuf::from("test.txt"));
+        assert_eq!(*path, PathBuf::from("test.txt"));
         assert_eq!(layer, LayerType::Upper);
         assert!(!has_open);
     }

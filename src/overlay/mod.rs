@@ -288,7 +288,7 @@ impl Filesystem for TreebeardFs {
         let inodes = self.inode_manager.inodes.read();
         if let Some(inode) = inodes.peek(ino) {
             let base = self.path_resolver.layer_base_path(inode.layer);
-            let path = base.join(&inode.path);
+            let path = base.join(&*inode.path);
             drop(inodes);
 
             if let Some(s) = size {
@@ -390,7 +390,7 @@ impl Filesystem for TreebeardFs {
                         let fallback_path = self
                             .path_resolver
                             .layer_base_path(inode.layer)
-                            .join(&inode.path);
+                            .join(&*inode.path);
                         tracing::warn!(
                             "open: resolve_path returned None, falling back to {}",
                             fallback_path.display()
@@ -622,7 +622,7 @@ impl Filesystem for TreebeardFs {
             let is_passthrough = self.path_resolver.is_passthrough(&rel_path);
             if layer == LayerType::Upper || is_passthrough {
                 let base = self.path_resolver.layer_base_path(layer);
-                let actual_path = base.join(&rel_path);
+                let actual_path = base.join(&*rel_path);
                 if let Ok(metadata) = fs::metadata(&actual_path) {
                     let new_attrs = metadata_to_fileattr(&metadata, ino);
                     self.inode_manager.update_attrs(ino, new_attrs);
@@ -712,7 +712,7 @@ impl Filesystem for TreebeardFs {
             LayerType::Upper
         };
         let base_path = self.path_resolver.layer_base_path(layer);
-        let child_path = base_path.join(&parent_path).join(name);
+        let child_path = base_path.join(&*parent_path).join(name);
 
         tracing::debug!(
             "create: creating file at {} (layer={:?})",
@@ -808,7 +808,7 @@ impl Filesystem for TreebeardFs {
         if layer == LayerType::Lower && !is_passthrough {
             self.mutations
                 .write()
-                .insert(rel_path.clone(), MutationType::Deleted);
+                .insert((*rel_path).clone(), MutationType::Deleted);
         }
 
         self.do_remove(parent, name, reply, std::fs::remove_file);
@@ -884,10 +884,10 @@ impl Filesystem for TreebeardFs {
                         LayerType::Upper
                     };
                     let base = self.path_resolver.layer_base_path(layer);
-                    let src = base.join(&i.path);
-                    let dest = base.join(&np.path).join(newname);
-                    let parent_path = np.path.clone();
-                    let old_rel = i.path.clone();
+                    let src = base.join(&*i.path);
+                    let dest = base.join(&*np.path).join(newname);
+                    let parent_path = Arc::clone(&np.path);
+                    let old_rel = Arc::clone(&i.path);
                     (src, dest, parent_path, old_rel, layer)
                 }
                 _ => {
@@ -1064,7 +1064,7 @@ impl Filesystem for TreebeardFs {
             LayerType::Upper
         };
         let base_path = self.path_resolver.layer_base_path(layer);
-        let child_path = base_path.join(&parent_path).join(name);
+        let child_path = base_path.join(&*parent_path).join(name);
 
         if let Err(e) = fs::create_dir(&child_path) {
             tracing::error!("mkdir error: {}", e);
@@ -1155,7 +1155,7 @@ impl Filesystem for TreebeardFs {
             return;
         };
 
-        let path = self.path_resolver.layer_base_path(layer).join(&rel_path);
+        let path = self.path_resolver.layer_base_path(layer).join(&*rel_path);
 
         match fs::read_link(&path) {
             Ok(target) => {
@@ -1276,7 +1276,7 @@ impl Filesystem for TreebeardFs {
             return;
         };
 
-        let path = self.path_resolver.layer_base_path(layer).join(&rel_path);
+        let path = self.path_resolver.layer_base_path(layer).join(&*rel_path);
 
         match xattr::get(&path, name) {
             Ok(Some(value)) => {
@@ -1305,7 +1305,7 @@ impl Filesystem for TreebeardFs {
             return;
         };
 
-        let path = self.path_resolver.layer_base_path(layer).join(&rel_path);
+        let path = self.path_resolver.layer_base_path(layer).join(&*rel_path);
 
         match xattr::list(&path) {
             Ok(attrs) => {

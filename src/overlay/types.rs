@@ -34,7 +34,9 @@ pub(crate) struct InodeData {
     pub parent: u64,
     pub name: OsString,
     pub layer: LayerType,
-    pub path: PathBuf,
+    /// The relative path of this inode within the overlay.
+    /// Wrapped in `Arc` to make cloning cheap in hot paths (e.g., write syscalls).
+    pub path: Arc<PathBuf>,
     pub attrs: FileAttr,
     pub open_file_handles: u64,
     pub hardlinks: u32,
@@ -165,7 +167,7 @@ mod tests {
             parent: 1,
             name: OsString::from("test.txt"),
             layer: LayerType::Upper,
-            path: PathBuf::from("test.txt"),
+            path: Arc::new(PathBuf::from("test.txt")),
             attrs: FileAttr {
                 ino: 100,
                 size: 1000,
@@ -207,7 +209,7 @@ mod tests {
                 parent: 1,
                 name: OsString::from(format!("file{}.txt", i)),
                 layer: LayerType::Upper,
-                path: PathBuf::from(format!("file{}.txt", i)),
+                path: Arc::new(PathBuf::from(format!("file{}.txt", i))),
                 attrs: FileAttr {
                     ino: i,
                     size: 1000,

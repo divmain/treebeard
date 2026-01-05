@@ -142,13 +142,14 @@ impl TreebeardFs {
         };
 
         let file_attrs = metadata_to_fileattr(&new_attrs, ino);
+        // Clone the path from Arc for update - this is an infrequent operation
         self.inode_manager
-            .update_after_copy_up(ino, src_info.0.clone(), file_attrs);
+            .update_after_copy_up(ino, (*src_info.0).clone(), file_attrs);
 
         if src_info.2.kind == fuser::FileType::RegularFile {
             self.mutations
                 .write()
-                .insert(src_info.0, MutationType::CopiedUp);
+                .insert((*src_info.0).clone(), MutationType::CopiedUp);
         }
 
         Ok(())
