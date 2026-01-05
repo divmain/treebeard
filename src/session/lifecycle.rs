@@ -1,13 +1,14 @@
+use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use crate::cleanup;
+use crate::cleanup::{self, CleanupContext};
 use crate::config::{Config, SandboxConfig};
 use crate::error::{Result, TreebeardError};
 use crate::git::GitRepo;
 use crate::overlay::MutationTracker;
 use crate::shell;
-use tokio::task;
+use tokio::task::JoinHandle;
 
 pub async fn run_shell_session(
     shell_path: &std::path::Path,
@@ -60,6 +61,76 @@ pub async fn run_shell_session(
     Ok(status.code().unwrap_or(1))
 }
 
+/// Spawn a task to monitor the watcher and log any issues.
+/// The watcher runs in the background and auto-commits changes.
+fn spawn_watcher_monitor(watcher_handle: JoinHandle<()>) {
+    tokio::spawn(async move {
+        match watcher_handle.await {
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!("Watcher task was cancelled");
+            }
+            Err(e) if e.is_panic() => {
+                eprintln!("Warning: Watcher task panicked");
+                eprintln!("Auto-commit may not be working properly");
+                eprintln!(
+                    "Your session will continue, but changes may not be automatically committed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Watcher task exited with error: {}", e);
+                eprintln!("Warning: Watcher task error");
+                eprintln!("Auto-commit may not be working properly");
+            }
+            Ok(()) => {
+                tracing::debug!("Watcher task completed normally");
+            }
+        }
+    });
+}
+
+/// Create a critical cleanup closure for FUSE unmounting.
+/// This ensures the filesystem is properly unmounted even on failures.
+fn create_critical_cleanup(mount_path: Option<PathBuf>) -> impl FnOnce() -> Result<()> {
+    move || -> Result<()> {
+        if let Some(ref mp) = mount_path {
+            let result = crate::overlay::perform_fuse_cleanup(mp);
+            if !result.unmount_succeeded || !result.directory_removed {
+                tracing::warn!(
+                    "FUSE cleanup incomplete - unmount: {}, dir_removed: {}",
+                    result.unmount_succeeded,
+                    result.directory_removed
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Print user-facing messages based on the shell exit code.
+fn print_exit_messages(exit_code: i32, branch_name: &str) {
+    if exit_code == 0 {
+        println!("Done!");
+        println!("Branch '{}' is ready to push", branch_name);
+    } else {
+        println!("Subprocess exited with non-zero status ({})", exit_code);
+        println!("Branch '{}' may have incomplete changes", branch_name);
+    }
+}
+
+/// Perform the full cleanup sequence including sync and worktree removal.
+async fn perform_cleanup_with_fallback(
+    ctx: &CleanupContext,
+    mount_path: Option<PathBuf>,
+) -> Result<()> {
+    let critical_cleanup = create_critical_cleanup(mount_path);
+
+    cleanup::run_with_cancel_handler(
+        async { cleanup::perform_cleanup(ctx).await },
+        critical_cleanup,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_cleanup_context(
     worktree_path: &std::path::Path,
@@ -90,6 +161,13 @@ pub fn build_cleanup_context(
     }
 }
 
+/// Run the shell session and perform cleanup when it exits.
+///
+/// This function orchestrates the session lifecycle:
+/// 1. Monitors the watcher task for errors
+/// 2. Runs the shell session
+/// 3. Performs cleanup (sync, squash, worktree removal)
+/// 4. Displays exit messages to the user
 #[allow(clippy::too_many_arguments)]
 pub async fn run_shell_and_cleanup(
     shell_path: &std::path::Path,
@@ -103,31 +181,12 @@ pub async fn run_shell_and_cleanup(
     worktree_repo: &GitRepo,
     base_commit: &str,
     failure_count: Arc<AtomicUsize>,
-    watcher_handle: task::JoinHandle<()>,
+    watcher_handle: JoinHandle<()>,
 ) -> Result<i32> {
-    tokio::spawn(async move {
-        match watcher_handle.await {
-            Err(e) if e.is_cancelled() => {
-                tracing::debug!("Watcher task was cancelled");
-            }
-            Err(e) if e.is_panic() => {
-                eprintln!("Warning: Watcher task panicked");
-                eprintln!("Auto-commit may not be working properly");
-                eprintln!(
-                    "Your session will continue, but changes may not be automatically committed"
-                );
-            }
-            Err(e) => {
-                tracing::warn!("Watcher task exited with error: {}", e);
-                eprintln!("Warning: Watcher task error");
-                eprintln!("Auto-commit may not be working properly");
-            }
-            Ok(()) => {
-                tracing::debug!("Watcher task completed normally");
-            }
-        }
-    });
+    // Monitor watcher task for errors (runs in background)
+    spawn_watcher_monitor(watcher_handle);
 
+    // Run the shell session
     let exit_code = run_shell_session(
         shell_path,
         branch_name,
@@ -137,6 +196,7 @@ pub async fn run_shell_and_cleanup(
     )
     .await?;
 
+    // Build cleanup context and perform cleanup
     let ctx = build_cleanup_context(
         worktree_path,
         branch_name,
@@ -149,34 +209,10 @@ pub async fn run_shell_and_cleanup(
         failure_count,
     );
 
-    let mount_path_for_cleanup = mount_path.clone();
-    let critical_cleanup = move || -> Result<()> {
-        if let Some(ref mp) = mount_path_for_cleanup {
-            let result = crate::overlay::perform_fuse_cleanup(mp);
-            if !result.unmount_succeeded || !result.directory_removed {
-                tracing::warn!(
-                    "FUSE cleanup incomplete - unmount: {}, dir_removed: {}",
-                    result.unmount_succeeded,
-                    result.directory_removed
-                );
-            }
-        }
-        Ok(())
-    };
+    perform_cleanup_with_fallback(&ctx, mount_path).await?;
 
-    cleanup::run_with_cancel_handler(
-        async { cleanup::perform_cleanup(&ctx).await },
-        critical_cleanup,
-    )
-    .await?;
-
-    if exit_code == 0 {
-        println!("Done!");
-        println!("Branch '{}' is ready to push", branch_name);
-    } else {
-        println!("Subprocess exited with non-zero status ({})", exit_code);
-        println!("Branch '{}' may have incomplete changes", branch_name);
-    }
+    // Display exit messages
+    print_exit_messages(exit_code, branch_name);
 
     Ok(exit_code)
 }
