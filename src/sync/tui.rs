@@ -237,7 +237,7 @@ pub fn run_interactive_selection(
     let mut ui = SyncUI::new();
     ui.enter_raw_mode()?;
 
-    let include_patterns = CompiledPatterns::new(&sync_config.sync_always_include);
+    let include_patterns = CompiledPatterns::new(&sync_config.get_sync_always_include());
     let mut selected: HashSet<usize> = HashSet::new();
     for (idx, item) in items.iter().enumerate() {
         let should_preselect = match item {

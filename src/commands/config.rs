@@ -18,18 +18,18 @@ pub fn handle_config_command(action: Option<ConfigAction>) -> Result<()> {
             println!();
             println!("Current configuration:");
             println!("  Paths:");
-            println!("    worktree_dir: {}", config.paths.worktree_dir);
-            println!("    mount_dir: {}", config.paths.mount_dir);
+            println!("    worktree_dir: {}", config.paths.get_worktree_dir());
+            println!("    mount_dir: {}", config.paths.get_mount_dir());
             println!("  Cleanup:");
             println!("    on_exit: {}", config.cleanup.on_exit);
             println!("  Commit:");
             println!(
                 "    auto_commit_message: {}",
-                config.commit.auto_commit_message
+                config.commit.get_auto_commit_message()
             );
             println!(
                 "    squash_commit_message: {}",
-                config.commit.squash_commit_message
+                config.commit.get_squash_commit_message()
             );
             println!("  Auto Commit Timing:");
             println!(
@@ -37,14 +37,17 @@ pub fn handle_config_command(action: Option<ConfigAction>) -> Result<()> {
                 config.auto_commit_timing.get_debounce_ms()
             );
             println!("  Other:");
-            println!("    fuse_ttl_secs: {}", config.fuse_ttl_secs);
-            if !config.sync.sync_always_skip.is_empty() {
-                println!("    sync_always_skip: {:?}", config.sync.sync_always_skip);
+            println!("    fuse_ttl_secs: {}", config.get_fuse_ttl_secs());
+            if !config.sync.get_sync_always_skip().is_empty() {
+                println!(
+                    "    sync_always_skip: {:?}",
+                    config.sync.get_sync_always_skip()
+                );
             }
-            if !config.sync.sync_always_include.is_empty() {
+            if !config.sync.get_sync_always_include().is_empty() {
                 println!(
                     "    sync_always_include: {:?}",
-                    config.sync.sync_always_include
+                    config.sync.get_sync_always_include()
                 );
             }
         }

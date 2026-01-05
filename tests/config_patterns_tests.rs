@@ -154,28 +154,28 @@ sync_always_include = [".env", ".env.local"]
     let parsed: treebeard::Config =
         toml::from_str(config_content).expect("Failed to parse config TOML");
 
-    assert_eq!(parsed.sync.sync_always_skip.len(), 3);
+    assert_eq!(parsed.sync.get_sync_always_skip().len(), 3);
     assert!(parsed
         .sync
-        .sync_always_skip
+        .get_sync_always_skip()
         .contains(&"node_modules/**".to_string()));
     assert!(parsed
         .sync
-        .sync_always_skip
+        .get_sync_always_skip()
         .contains(&"build/**".to_string()));
     assert!(parsed
         .sync
-        .sync_always_skip
+        .get_sync_always_skip()
         .contains(&".cache/**".to_string()));
 
-    assert_eq!(parsed.sync.sync_always_include.len(), 2);
+    assert_eq!(parsed.sync.get_sync_always_include().len(), 2);
     assert!(parsed
         .sync
-        .sync_always_include
+        .get_sync_always_include()
         .contains(&".env".to_string()));
     assert!(parsed
         .sync
-        .sync_always_include
+        .get_sync_always_include()
         .contains(&".env.local".to_string()));
 }
 
@@ -187,7 +187,7 @@ fn test_config_sync_always_skip_default() {
     let config = load_config().expect("Failed to load config");
 
     assert!(
-        config.sync.sync_always_skip.is_empty(),
+        config.sync.get_sync_always_skip().is_empty(),
         "sync_always_skip should default to empty"
     );
 }
@@ -200,7 +200,7 @@ fn test_config_sync_always_include_default() {
     let config = load_config().expect("Failed to load config");
 
     assert!(
-        config.sync.sync_always_include.is_empty(),
+        config.sync.get_sync_always_include().is_empty(),
         "sync_always_include should default to empty"
     );
 }

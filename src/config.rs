@@ -40,57 +40,73 @@ impl std::str::FromStr for OnExitBehavior {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PathsConfig {
-    #[serde(default = "default_worktree_dir")]
-    pub worktree_dir: String,
-    #[serde(default = "default_mount_dir")]
-    pub mount_dir: String,
-    #[serde(default = "default_passthrough")]
-    pub passthrough: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<Vec<String>>,
 }
 
-impl Default for PathsConfig {
-    fn default() -> Self {
-        PathsConfig {
-            worktree_dir: default_worktree_dir(),
-            mount_dir: default_mount_dir(),
-            passthrough: default_passthrough(),
-        }
+impl PathsConfig {
+    pub fn get_worktree_dir(&self) -> String {
+        self.worktree_dir
+            .clone()
+            .unwrap_or_else(default_worktree_dir)
+    }
+
+    pub fn get_mount_dir(&self) -> String {
+        self.mount_dir.clone().unwrap_or_else(default_mount_dir)
+    }
+
+    pub fn get_passthrough(&self) -> Vec<String> {
+        self.passthrough.clone().unwrap_or_else(default_passthrough)
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CommitConfig {
-    #[serde(default = "default_auto_commit_message")]
-    pub auto_commit_message: String,
-    #[serde(default = "default_squash_commit_message")]
-    pub squash_commit_message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_commit_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squash_commit_message: Option<String>,
 }
 
-impl Default for CommitConfig {
-    fn default() -> Self {
-        CommitConfig {
-            auto_commit_message: default_auto_commit_message(),
-            squash_commit_message: default_squash_commit_message(),
-        }
+impl CommitConfig {
+    pub fn get_auto_commit_message(&self) -> String {
+        self.auto_commit_message
+            .clone()
+            .unwrap_or_else(default_auto_commit_message)
+    }
+
+    pub fn get_squash_commit_message(&self) -> String {
+        self.squash_commit_message
+            .clone()
+            .unwrap_or_else(default_squash_commit_message)
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncConfig {
-    #[serde(default = "default_sync_always_skip")]
-    pub sync_always_skip: Vec<String>,
-    #[serde(default = "default_sync_always_include")]
-    pub sync_always_include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_always_skip: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_always_include: Option<Vec<String>>,
 }
 
-impl Default for SyncConfig {
-    fn default() -> Self {
-        SyncConfig {
-            sync_always_skip: default_sync_always_skip(),
-            sync_always_include: default_sync_always_include(),
-        }
+impl SyncConfig {
+    pub fn get_sync_always_skip(&self) -> Vec<String> {
+        self.sync_always_skip
+            .clone()
+            .unwrap_or_else(default_sync_always_skip)
+    }
+
+    pub fn get_sync_always_include(&self) -> Vec<String> {
+        self.sync_always_include
+            .clone()
+            .unwrap_or_else(default_sync_always_include)
     }
 }
 
@@ -148,7 +164,7 @@ impl AutoCommitTimingConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub paths: PathsConfig,
@@ -162,24 +178,15 @@ pub struct Config {
     pub auto_commit_timing: AutoCommitTimingConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
-    #[serde(default = "default_fuse_ttl_secs")]
-    pub fuse_ttl_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse_ttl_secs: Option<u64>,
     #[serde(default)]
     pub sandbox: SandboxConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            paths: PathsConfig::default(),
-            commit: CommitConfig::default(),
-            sync: SyncConfig::default(),
-            cleanup: CleanupConfig::default(),
-            auto_commit_timing: AutoCommitTimingConfig::default(),
-            hooks: HooksConfig::default(),
-            fuse_ttl_secs: default_fuse_ttl_secs(),
-            sandbox: SandboxConfig::default(),
-        }
+impl Config {
+    pub fn get_fuse_ttl_secs(&self) -> u64 {
+        self.fuse_ttl_secs.unwrap_or_else(default_fuse_ttl_secs)
     }
 }
 
@@ -421,41 +428,26 @@ fn load_project_config() -> Result<Option<Config>> {
 fn merge_configs(base: Config, overlay: Config) -> Config {
     Config {
         paths: PathsConfig {
-            worktree_dir: if overlay.paths.worktree_dir != default_worktree_dir() {
-                overlay.paths.worktree_dir
-            } else {
-                base.paths.worktree_dir
-            },
-            mount_dir: if overlay.paths.mount_dir != default_mount_dir() {
-                overlay.paths.mount_dir
-            } else {
-                base.paths.mount_dir
-            },
-            passthrough: if !overlay.paths.passthrough.is_empty() {
-                overlay.paths.passthrough
-            } else {
-                base.paths.passthrough
-            },
+            worktree_dir: overlay.paths.worktree_dir.or(base.paths.worktree_dir),
+            mount_dir: overlay.paths.mount_dir.or(base.paths.mount_dir),
+            passthrough: overlay.paths.passthrough.or(base.paths.passthrough),
         },
         commit: CommitConfig {
-            auto_commit_message: if overlay.commit.auto_commit_message
-                != default_auto_commit_message()
-            {
-                overlay.commit.auto_commit_message
-            } else {
-                base.commit.auto_commit_message
-            },
-            squash_commit_message: if overlay.commit.squash_commit_message
-                != default_squash_commit_message()
-            {
-                overlay.commit.squash_commit_message
-            } else {
-                base.commit.squash_commit_message
-            },
+            auto_commit_message: overlay
+                .commit
+                .auto_commit_message
+                .or(base.commit.auto_commit_message),
+            squash_commit_message: overlay
+                .commit
+                .squash_commit_message
+                .or(base.commit.squash_commit_message),
         },
         sync: SyncConfig {
-            sync_always_skip: overlay.sync.sync_always_skip,
-            sync_always_include: overlay.sync.sync_always_include,
+            sync_always_skip: overlay.sync.sync_always_skip.or(base.sync.sync_always_skip),
+            sync_always_include: overlay
+                .sync
+                .sync_always_include
+                .or(base.sync.sync_always_include),
         },
         cleanup: CleanupConfig {
             on_exit: overlay.cleanup.on_exit,
@@ -470,13 +462,9 @@ fn merge_configs(base: Config, overlay: Config) -> Config {
             post_create: overlay.hooks.post_create,
             pre_cleanup: overlay.hooks.pre_cleanup,
             post_cleanup: overlay.hooks.post_cleanup,
-            commit_message: overlay.hooks.commit_message,
+            commit_message: overlay.hooks.commit_message.or(base.hooks.commit_message),
         },
-        fuse_ttl_secs: if overlay.fuse_ttl_secs != default_fuse_ttl_secs() {
-            overlay.fuse_ttl_secs
-        } else {
-            base.fuse_ttl_secs
-        },
+        fuse_ttl_secs: overlay.fuse_ttl_secs.or(base.fuse_ttl_secs),
         // Project-level sandbox config completely replaces global config
         sandbox: overlay.sandbox,
     }
@@ -487,7 +475,7 @@ pub fn get_worktree_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(env_dir).join("worktrees"));
     }
     let config = load_config()?;
-    expand_path(&config.paths.worktree_dir)
+    expand_path(&config.paths.get_worktree_dir())
 }
 
 pub fn get_mount_dir() -> Result<PathBuf> {
@@ -495,7 +483,7 @@ pub fn get_mount_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(env_dir).join("mounts"));
     }
     let config = load_config()?;
-    expand_path(&config.paths.mount_dir)
+    expand_path(&config.paths.get_mount_dir())
 }
 
 pub fn save_config(config: &Config) -> Result<()> {

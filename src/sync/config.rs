@@ -3,12 +3,14 @@ use crate::error::Result;
 
 fn save_config_pattern<F>(pattern: String, field_accessor: F) -> Result<()>
 where
-    F: FnOnce(&mut Config) -> &mut Vec<String>,
+    F: FnOnce(&mut Config) -> &mut Option<Vec<String>>,
 {
     let mut config = load_config()?;
     let field = field_accessor(&mut config);
-    if !field.contains(&pattern) {
-        field.push(pattern);
+
+    let vec = field.get_or_insert_with(Vec::new);
+    if !vec.contains(&pattern) {
+        vec.push(pattern);
         save_config(&config)?;
     }
     Ok(())

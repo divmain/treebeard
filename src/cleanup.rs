@@ -52,7 +52,7 @@ impl CleanupContext {
             squash_message: self
                 .config
                 .commit
-                .squash_commit_message
+                .get_squash_commit_message()
                 .replace("{branch}", &self.branch_name),
             base_commit: self.base_commit.clone(),
         }

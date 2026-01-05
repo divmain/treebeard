@@ -59,7 +59,7 @@ fn test_config_shell_expansion() {
 
     let worktree_dir = get_worktree_dir().expect("Failed to get worktree dir");
 
-    let raw_worktree_dir = &config.paths.worktree_dir;
+    let raw_worktree_dir = &config.paths.get_worktree_dir();
 
     assert!(
         raw_worktree_dir.contains("~"),
@@ -189,7 +189,7 @@ fn test_missing_config_uses_defaults() {
     );
     let config = config.unwrap();
     assert!(
-        !config.paths.worktree_dir.is_empty(),
+        !config.paths.get_worktree_dir().is_empty(),
         "Should have default worktree_dir"
     );
 

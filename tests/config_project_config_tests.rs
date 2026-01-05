@@ -73,21 +73,22 @@ auto_commit_message = "project: auto-commit"
         .contains(&"echo 'project hook 2'".to_string()));
 
     assert_eq!(
-        config.sync.sync_always_skip.len(),
+        config.sync.get_sync_always_skip().len(),
         2,
         "Project config should override user config for sync_always_skip"
     );
     assert!(config
         .sync
-        .sync_always_skip
+        .get_sync_always_skip()
         .contains(&"build/**".to_string()));
     assert!(config
         .sync
-        .sync_always_skip
+        .get_sync_always_skip()
         .contains(&"dist/**".to_string()));
 
     assert_eq!(
-        config.commit.auto_commit_message, "project: auto-commit",
+        config.commit.get_auto_commit_message(),
+        "project: auto-commit",
         "Project config should provide values not set in user config"
     );
 }
@@ -154,12 +155,12 @@ fn test_defaults_used_when_no_config_exists() {
     );
 
     assert!(
-        config.sync.sync_always_skip.is_empty(),
+        config.sync.get_sync_always_skip().is_empty(),
         "Default sync_always_skip should be empty when no config exists"
     );
 
     assert!(
-        config.sync.sync_always_include.is_empty(),
+        config.sync.get_sync_always_include().is_empty(),
         "Default sync_always_include should be empty when no config exists"
     );
 }
@@ -277,7 +278,8 @@ sync_always_skip = ["project-skip-1"]
 
     // Project config should replace user config values
     assert_eq!(
-        config.commit.auto_commit_message, "project: commit",
+        config.commit.get_auto_commit_message(),
+        "project: commit",
         "Project config should override user config auto_commit_message"
     );
 
@@ -288,15 +290,16 @@ sync_always_skip = ["project-skip-1"]
     );
 
     assert_eq!(
-        config.sync.sync_always_skip,
+        config.sync.get_sync_always_skip(),
         vec!["project-skip-1".to_string()],
         "Project config should replace user config sync_always_skip"
     );
 
-    // When project config doesn't specify a field, it gets the default (empty for vectors)
-    assert!(
-        config.sync.sync_always_include.is_empty(),
-        "sync_always_include should be empty when not in project config"
+    // When project config doesn't specify a field, it falls back to user config
+    assert_eq!(
+        config.sync.get_sync_always_include(),
+        vec!["user-include-1".to_string()],
+        "sync_always_include should fall back to user config when not in project config"
     );
 }
 
@@ -342,11 +345,11 @@ sync_always_include = []
         "Empty project config should override user config for post_create"
     );
     assert!(
-        config.sync.sync_always_skip.is_empty(),
+        config.sync.get_sync_always_skip().is_empty(),
         "Empty project config should override user config for sync_always_skip"
     );
     assert!(
-        config.sync.sync_always_include.is_empty(),
+        config.sync.get_sync_always_include().is_empty(),
         "Empty project config should override user config for sync_always_include"
     );
 }

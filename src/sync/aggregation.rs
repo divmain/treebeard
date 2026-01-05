@@ -130,7 +130,7 @@ pub fn filter_syncable_items(
         })
         .collect();
 
-    let skip_patterns = CompiledPatterns::new(&sync_config.sync_always_skip);
+    let skip_patterns = CompiledPatterns::new(&sync_config.get_sync_always_skip());
     let mut auto_skipped: Vec<ChangeItem> = Vec::new();
     let items_to_show: Vec<ChangeItem> = gitignored_items
         .into_iter()

@@ -40,8 +40,8 @@ pub fn setup_overlay_and_watcher(
         &mount_path,
         worktree_path,
         main_repo_path,
-        config.fuse_ttl_secs,
-        config.paths.passthrough.clone(),
+        config.get_fuse_ttl_secs(),
+        config.paths.get_passthrough(),
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -77,7 +77,7 @@ pub fn setup_overlay_and_watcher(
     // Use the hooks-aware watcher if a commit_message hook is configured
     let watcher_handle: task::JoinHandle<()> = if config.hooks.commit_message.is_some() {
         let commit_config = watcher::CommitConfig::new(
-            &config.commit.auto_commit_message,
+            &config.commit.get_auto_commit_message(),
             &config.hooks,
             branch_name,
             &mount_path,
@@ -98,7 +98,7 @@ pub fn setup_overlay_and_watcher(
             }
         })
     } else {
-        let auto_commit_message = config.commit.auto_commit_message.clone();
+        let auto_commit_message = config.commit.get_auto_commit_message();
         tokio::spawn(async move {
             if let Err(e) = watcher::watch_and_commit(
                 mutation_rx,
