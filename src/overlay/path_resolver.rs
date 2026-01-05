@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::overlay::types::LayerType;
 use crate::overlay::whiteout::Whiteout;
@@ -15,6 +17,8 @@ pub struct PathResolver {
     pub(crate) lower_layer: PathBuf,
     /// Glob patterns for paths that bypass the upper layer entirely
     passthrough_patterns: Vec<glob::Pattern>,
+    /// Cache of passthrough status for paths already checked
+    passthrough_cache: Arc<parking_lot::RwLock<HashMap<Arc<str>, bool>>>,
 }
 
 impl PathResolver {
@@ -40,6 +44,7 @@ impl PathResolver {
             upper_layer,
             lower_layer,
             passthrough_patterns: compiled_patterns,
+            passthrough_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         })
     }
 
@@ -59,32 +64,42 @@ impl PathResolver {
     /// A path is considered passthrough if:
     /// 1. It directly matches a passthrough pattern (e.g., `.claude/config.toml` matches `.claude/**`)
     /// 2. It is a parent directory of a passthrough pattern (e.g., `.claude` matches if pattern is `.claude/**`)
+    ///
+    /// Results are cached to avoid repeated pattern matching for the same paths.
     pub fn is_passthrough(&self, relative_path: &Path) -> bool {
         let path_to_match = relative_path.strip_prefix(".").unwrap_or(relative_path);
         let path_str = path_to_match.to_string_lossy();
+        let path_key: Arc<str> = Arc::from(path_str.as_ref());
 
-        self.passthrough_patterns.iter().any(|p| {
-            // Direct match
+        {
+            let cache = self.passthrough_cache.read();
+            if let Some(&cached) = cache.get(&path_key) {
+                return cached;
+            }
+        }
+
+        let result = self.passthrough_patterns.iter().any(|p| {
             if p.matches_path(path_to_match) {
                 return true;
             }
 
-            // Check if this path is a parent/prefix of the pattern.
-            // For example, if pattern is ".claude/**", then ".claude" should also be passthrough.
             let pattern_str = p.as_str();
             if let Some(prefix) = pattern_str.strip_suffix("/**") {
-                // Path matches the directory prefix exactly
                 if path_str == prefix {
                     return true;
                 }
-                // Path is a parent of the prefix (e.g., "foo" when pattern is "foo/bar/**")
                 if prefix.starts_with(&format!("{}/", path_str)) {
                     return true;
                 }
             }
 
             false
-        })
+        });
+
+        let cache_key = Arc::clone(&path_key);
+        self.passthrough_cache.write().insert(cache_key, result);
+
+        result
     }
 
     /// Resolve the actual filesystem path for a relative path.
@@ -239,6 +254,41 @@ mod tests {
         // Non-matches
         assert!(!resolver.is_passthrough(Path::new("src/main.rs")));
         assert!(!resolver.is_passthrough(Path::new(".git/config")));
+    }
+
+    #[test]
+    fn test_is_passthrough_caching() {
+        let temp_dir = tempdir().unwrap();
+        let upper = temp_dir.path().join("upper");
+        let lower = temp_dir.path().join("lower");
+
+        let resolver = PathResolver::new(
+            upper,
+            lower,
+            vec![".claude/**".to_string(), "node_modules/**".to_string()],
+        )
+        .unwrap();
+
+        // First call - not cached
+        assert!(resolver.is_passthrough(Path::new(".claude/config.toml")));
+        let cache_size_1 = resolver.passthrough_cache.read().len();
+        assert!(cache_size_1 > 0);
+
+        // Second call - should be cached
+        assert!(resolver.is_passthrough(Path::new(".claude/config.toml")));
+        let cache_size_2 = resolver.passthrough_cache.read().len();
+        assert_eq!(cache_size_1, cache_size_2);
+
+        // Different path - should add to cache
+        assert!(!resolver.is_passthrough(Path::new("src/main.rs")));
+        let cache_size_3 = resolver.passthrough_cache.read().len();
+        assert!(cache_size_3 > cache_size_1);
+
+        // Call the same paths again - should all be cached
+        assert!(resolver.is_passthrough(Path::new(".claude/config.toml")));
+        assert!(!resolver.is_passthrough(Path::new("src/main.rs")));
+        let cache_size_4 = resolver.passthrough_cache.read().len();
+        assert_eq!(cache_size_3, cache_size_4);
     }
 
     #[test]
