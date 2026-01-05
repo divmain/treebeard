@@ -208,30 +208,36 @@ impl GitRepo {
         Ok(gitdir_path.parent().unwrap().to_path_buf())
     }
 
+    fn stage_all(&self) -> Result<()> {
+        let stage_output = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&self.workdir)
+            .output()
+            .map_err(|e| {
+                TreebeardError::Config(format!(
+                    "Failed to execute 'git add' in {}: {}",
+                    self.workdir.display(),
+                    e
+                ))
+            })?;
+
+        if !stage_output.status.success() {
+            let stderr = String::from_utf8_lossy(&stage_output.stderr);
+            return Err(TreebeardError::Git(format!(
+                "Failed to stage changes: {}",
+                stderr.trim()
+            )));
+        }
+
+        Ok(())
+    }
+
     pub fn stage_and_commit(&self, message: &str) -> Result<()> {
         tracing::debug!("stage_and_commit() in directory: {:?}", self.workdir);
 
         with_retry(
             || {
-                let stage_output = std::process::Command::new("git")
-                    .args(["add", "-A"])
-                    .current_dir(&self.workdir)
-                    .output()
-                    .map_err(|e| {
-                        TreebeardError::Config(format!(
-                            "Failed to execute 'git add' in {}: {}",
-                            self.workdir.display(),
-                            e
-                        ))
-                    })?;
-
-                if !stage_output.status.success() {
-                    let stderr = String::from_utf8_lossy(&stage_output.stderr);
-                    return Err(TreebeardError::Git(format!(
-                        "Failed to stage changes: {}",
-                        stderr.trim()
-                    )));
-                }
+                self.stage_all()?;
 
                 let output = std::process::Command::new("git")
                     .args(["diff", "--cached"])
@@ -273,25 +279,7 @@ impl GitRepo {
     pub fn stage_changes(&self) -> Result<Option<String>> {
         tracing::debug!("stage_changes() in directory: {:?}", self.workdir);
 
-        let stage_output = std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&self.workdir)
-            .output()
-            .map_err(|e| {
-                TreebeardError::Config(format!(
-                    "Failed to execute 'git add' in {}: {}",
-                    self.workdir.display(),
-                    e
-                ))
-            })?;
-
-        if !stage_output.status.success() {
-            let stderr = String::from_utf8_lossy(&stage_output.stderr);
-            return Err(TreebeardError::Git(format!(
-                "Failed to stage changes: {}",
-                stderr.trim()
-            )));
-        }
+        self.stage_all()?;
 
         let output = std::process::Command::new("git")
             .args(["diff", "--cached"])
