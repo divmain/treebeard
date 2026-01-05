@@ -1,5 +1,6 @@
 use glob::Pattern;
 use std::path::Path;
+use tracing::warn;
 
 pub struct CompiledPatterns {
     patterns: Vec<Pattern>,
@@ -7,10 +8,16 @@ pub struct CompiledPatterns {
 
 impl CompiledPatterns {
     pub fn new(pattern_strings: &[String]) -> Self {
-        let patterns: Vec<Pattern> = pattern_strings
-            .iter()
-            .filter_map(|s| Pattern::new(s).ok())
-            .collect();
+        let mut patterns = Vec::new();
+
+        for pattern_str in pattern_strings {
+            match Pattern::new(pattern_str) {
+                Ok(pattern) => patterns.push(pattern),
+                Err(e) => {
+                    warn!("Invalid glob pattern '{}': {}", pattern_str, e);
+                }
+            }
+        }
 
         CompiledPatterns { patterns }
     }
