@@ -250,7 +250,9 @@ impl TreebeardFs {
         };
 
         if let Some(p) = path {
-            let _ = fs::remove_file(&p).or_else(|_| fs::remove_dir(&p));
+            if let Err(e) = fs::remove_file(&p).or_else(|_| fs::remove_dir(&p)) {
+                tracing::warn!("Failed to delete during cleanup: {} ({})", p.display(), e);
+            }
         }
     }
 
@@ -265,7 +267,13 @@ impl TreebeardFs {
         };
 
         if layer == LayerType::Upper {
-            let _ = fs::remove_file(&path).or_else(|_| fs::remove_dir(&path));
+            if let Err(e) = fs::remove_file(&path).or_else(|_| fs::remove_dir(&path)) {
+                tracing::warn!(
+                    "Failed to delete during garbage collection: {} ({})",
+                    path.display(),
+                    e
+                );
+            }
         }
 
         self.inodes.write().remove(ino);

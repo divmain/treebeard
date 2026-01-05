@@ -152,7 +152,14 @@ pub async fn run_shell_and_cleanup(
     let mount_path_for_cleanup = mount_path.clone();
     let critical_cleanup = move || -> Result<()> {
         if let Some(ref mp) = mount_path_for_cleanup {
-            let _ = crate::overlay::perform_fuse_cleanup(mp);
+            let result = crate::overlay::perform_fuse_cleanup(mp);
+            if !result.unmount_succeeded || !result.directory_removed {
+                tracing::warn!(
+                    "FUSE cleanup incomplete - unmount: {}, dir_removed: {}",
+                    result.unmount_succeeded,
+                    result.directory_removed
+                );
+            }
         }
         Ok(())
     };
