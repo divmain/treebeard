@@ -6,7 +6,38 @@
 //! to sensitive data like SSH keys, AWS credentials, etc.
 
 use crate::config::{expand_tilde, NetworkMode, SandboxConfig};
+use crate::error::{Result, TreebeardError};
 use std::path::Path;
+
+/// Validates a path for safe inclusion in an SBPL profile.
+///
+/// This function checks that a path doesn't contain characters that
+/// could be interpreted as SBPL syntax, preventing injection attacks.
+///
+/// # Arguments
+/// * `path` - The path to validate
+///
+/// # Returns
+/// An error if the path contains invalid characters, Ok otherwise
+#[cfg(target_os = "macos")]
+fn validate_sbpl_path(path: &Path) -> Result<()> {
+    let path_str = path.to_str().ok_or_else(|| {
+        TreebeardError::Config("Sandbox path contains invalid UTF-8 characters".to_string())
+    })?;
+
+    // Check for SBPL special characters that could be interpreted as directives
+    let forbidden_chars = ['(', ')', ';', '"', '\\', '\n', '\r'];
+    for (i, c) in path_str.chars().enumerate() {
+        if forbidden_chars.contains(&c) {
+            return Err(TreebeardError::Config(format!(
+                "Sandbox path contains forbidden character '{}' at position {}: {}",
+                c, i, path_str
+            )));
+        }
+    }
+
+    Ok(())
+}
 
 /// Generates an SBPL (Sandbox Profile Language) profile string for sandbox-exec.
 ///
@@ -58,6 +89,11 @@ pub fn generate_sbpl_profile(config: &SandboxConfig, mount_path: &Path) -> Strin
         profile.push_str("; Deny reads to sensitive paths (from deny_read config)\n");
         for path in &config.deny_read {
             let expanded = expand_tilde(path);
+            // Validate path to prevent SBPL injection
+            if let Err(e) = validate_sbpl_path(&expanded) {
+                tracing::warn!("Skipping invalid deny_read path {:?}: {}", path, e);
+                continue;
+            }
             let path_str = expanded.to_string_lossy();
             // Use subpath to include all files under the directory
             profile.push_str(&format!("(deny file-read* (subpath \"{}\"))\n", path_str));
@@ -94,6 +130,11 @@ pub fn generate_sbpl_profile(config: &SandboxConfig, mount_path: &Path) -> Strin
         profile.push_str("; Allow additional user-specified write paths\n");
         for path in &config.allow_write {
             let expanded = expand_tilde(path);
+            // Validate path to prevent SBPL injection
+            if let Err(e) = validate_sbpl_path(&expanded) {
+                tracing::warn!("Skipping invalid allow_write path {:?}: {}", path, e);
+                continue;
+            }
             let path_str = expanded.to_string_lossy();
             profile.push_str(&format!("(allow file-write* (subpath \"{}\"))\n", path_str));
         }
@@ -312,5 +353,113 @@ mod tests {
         // Should contain the expanded custom-cache path
         assert!(profile.contains("custom-cache"));
         assert!(profile.contains("(allow file-write*"));
+    }
+
+    #[test]
+    fn test_validate_sbpl_path_rejects_parentheses() {
+        let path = PathBuf::from("/path/with).injection");
+        assert!(validate_sbpl_path(&path).is_err());
+    }
+
+    #[test]
+    fn test_validate_sbpl_path_rejects_semicolon() {
+        let path = PathBuf::from("/path;injection");
+        assert!(validate_sbpl_path(&path).is_err());
+    }
+
+    #[test]
+    fn test_validate_sbpl_path_rejects_quotes() {
+        let path = PathBuf::from("/path\"injection");
+        assert!(validate_sbpl_path(&path).is_err());
+    }
+
+    #[test]
+    fn test_validate_sbpl_path_rejects_backslash() {
+        let path = PathBuf::from("/path\\injection");
+        assert!(validate_sbpl_path(&path).is_err());
+    }
+
+    #[test]
+    fn test_validate_sbpl_path_rejects_newlines() {
+        let path = PathBuf::from("/path\ninjection");
+        assert!(validate_sbpl_path(&path).is_err());
+    }
+
+    #[test]
+    fn test_validate_sbpl_path_rejects_carriage_return() {
+        let path = PathBuf::from("/path\rinjection");
+        assert!(validate_sbpl_path(&path).is_err());
+    }
+
+    #[test]
+    fn test_validate_sbpl_path_accepts_valid_paths() {
+        let valid_paths = vec![
+            PathBuf::from("/home/user/.ssh"),
+            PathBuf::from("/var/folders/abc"),
+            PathBuf::from("/tmp/file.txt"),
+            PathBuf::from("/home/user/name with spaces"),
+            PathBuf::from("/home/user/unicode_ñ"),
+        ];
+        for path in valid_paths {
+            assert!(
+                validate_sbpl_path(&path).is_ok(),
+                "Valid path {:?} should pass validation",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_sbpl_profile_skips_invalid_deny_read_paths() {
+        let mut config = default_test_config();
+        // Add a malicious path that tries to inject SBPL directives
+        config
+            .deny_read
+            .push("~/.ssh\") (allow file-read* (subpath \"/etc/shadow".to_string());
+        let mount_path = PathBuf::from("/mounts/repo/branch");
+        let profile = generate_sbpl_profile(&config, &mount_path);
+
+        // The malicious path should be skipped, so we shouldn't see the injection
+        assert!(!profile.contains("(allow file-read* (subpath \"/etc/shadow\")"));
+        // Legitimate paths should still be present
+        assert!(profile.contains(".ssh"));
+        assert!(profile.contains(".aws"));
+    }
+
+    #[test]
+    fn test_generate_sbpl_profile_skips_invalid_allow_write_paths() {
+        let config = SandboxConfig {
+            enabled: true,
+            deny_read: vec![],
+            // Add a malicious path that tries to inject SBPL directives
+            allow_write: vec!["~/cache\") (allow file-write* (subpath \"/etc".to_string()],
+            network: SandboxNetworkConfig::default(),
+        };
+        let mount_path = PathBuf::from("/mounts/repo/branch");
+        let profile = generate_sbpl_profile(&config, &mount_path);
+
+        // The malicious path should be skipped, so we shouldn't see the injection
+        assert!(!profile.contains("(allow file-write* (subpath \"/etc\")"));
+        assert!(!profile.contains("cache"));
+    }
+
+    #[test]
+    fn test_generate_sbpl_profile_handles_valid_special_characters() {
+        let config = SandboxConfig {
+            enabled: true,
+            deny_read: vec![
+                "~/path with spaces".to_string(),
+                "~/path_with_underscore".to_string(),
+            ],
+            allow_write: vec!["~/cache-dash".to_string()],
+            network: SandboxNetworkConfig::default(),
+        };
+        let mount_path = PathBuf::from("/mounts/repo/branch");
+        let profile = generate_sbpl_profile(&config, &mount_path);
+
+        // Valid characters like spaces, dashes, underscores should work
+        assert!(profile.contains("path with spaces"));
+        assert!(profile.contains("path_with_underscore"));
+        assert!(profile.contains("cache-dash"));
     }
 }
