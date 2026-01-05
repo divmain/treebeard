@@ -403,6 +403,17 @@ impl TreebeardFs {
         })
     }
 
+    /// Get inode information from the inode table.
+    ///
+    /// This is the common lookup pattern used throughout FUSE callbacks.
+    /// Returns `(path, layer, has_open_handles)` if the inode exists, or `None` otherwise.
+    pub(crate) fn get_inode_info(&self, ino: u64) -> Option<(PathBuf, LayerType, bool)> {
+        let inodes = self.inodes.read();
+        inodes
+            .peek(ino)
+            .map(|i| (i.path.clone(), i.layer, i.open_file_handles > 0))
+    }
+
     /// Creates a new InodeData with the given parameters.
     ///
     /// This helper reduces code duplication across FUSE operations that need
