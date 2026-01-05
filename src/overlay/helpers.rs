@@ -1,9 +1,12 @@
 use fuser::{FileAttr, FileType};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CString, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 use crate::overlay::convert::{metadata_to_fileattr, std_filetype_to_fuser};
 use crate::overlay::types::{InodeData, LayerType, MutationType};
@@ -193,8 +196,9 @@ impl TreebeardFs {
     /// in the same directory within the upper layer.
     pub(crate) fn is_whiteout(&self, path: &Path) -> bool {
         if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-            let whiteout_name = format!(".wh.{}", name.to_string_lossy());
-            let whiteout_path = parent.join(&whiteout_name);
+            let mut whiteout_name = OsString::from(".wh.");
+            whiteout_name.push(name);
+            let whiteout_path = parent.join(whiteout_name);
             whiteout_path.exists()
         } else {
             false
@@ -225,8 +229,9 @@ impl TreebeardFs {
         }
 
         // Create .wh.<filename> whiteout marker
-        let whiteout_name = format!(".wh.{}", name.to_string_lossy());
-        let whiteout_path = parent_path.join(&whiteout_name);
+        let mut whiteout_name = OsString::from(".wh.");
+        whiteout_name.push(name);
+        let whiteout_path = parent_path.join(whiteout_name);
 
         // Create an empty file as the whiteout marker
         File::create(&whiteout_path).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
@@ -660,12 +665,28 @@ impl TreebeardFs {
 
             // Handle whiteouts only in upper layer
             if layer == LayerType::Upper {
-                let name_str = name.to_string_lossy();
-                if let Some(target_name) = name_str.strip_prefix(".wh.") {
-                    let target = OsString::from(target_name);
-                    entries.remove(&target);
-                    whiteouts.insert(target);
-                    continue;
+                #[cfg(unix)]
+                {
+                    let name_bytes = name.as_bytes();
+                    let wh_prefix = b".wh.";
+                    if name_bytes.starts_with(wh_prefix) {
+                        let target_bytes = &name_bytes[wh_prefix.len()..];
+                        let target = OsString::from(OsStr::from_bytes(target_bytes));
+                        entries.remove(&target);
+                        whiteouts.insert(target);
+                        continue;
+                    }
+                }
+
+                #[cfg(not(unix))]
+                {
+                    let name_str = name.to_string_lossy();
+                    if let Some(target_name) = name_str.strip_prefix(".wh.") {
+                        let target = OsString::from(target_name);
+                        entries.remove(&target);
+                        whiteouts.insert(target);
+                        continue;
+                    }
                 }
             }
 
