@@ -3,63 +3,18 @@
 mod common;
 mod fuse_common;
 
-use common::TestWorkspace;
-use fuse_common::{check_macfuse_installed, determine_mount_point};
-use fuser::Session;
 use std::fs;
 use std::thread;
-use treebeard::overlay::TreebeardFs;
 
 /// Hard link inode tracking
 #[test]
 fn test_fuse_real_hardlink_inodes() {
-    if !check_macfuse_installed() {
-        eprintln!("Skipping real FUSE test - macFUSE not installed");
-        return;
-    }
-
-    let test_name = "hardlink-inodes";
-    let mountpoint = match determine_mount_point(test_name) {
-        Ok(mp) => mp,
-        Err(e) => {
-            eprintln!("Failed to determine mount point: {}", e);
-            return;
-        }
+    let session = match fuse_common::FuseTestSession::new("hardlink-inodes") {
+        Some(s) => s,
+        None => return,
     };
 
-    let upper_layer = tempfile::tempdir().unwrap().keep();
-    let lower_layer = tempfile::tempdir().unwrap().keep();
-
-    let fs = match TreebeardFs::new(upper_layer.clone(), lower_layer.clone(), None, 1, vec![]) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Failed to create TreebeardFs: {}", e);
-            return;
-        }
-    };
-
-    let _cleanup = fuse_common::MountCleanup::new(mountpoint.clone());
-    let session = match Session::new(fs, &mountpoint, &[]) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to create FUSE session: {}", e);
-            return;
-        }
-    };
-
-    let handle = match session.spawn() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("Failed to spawn FUSE session: {}", e);
-            return;
-        }
-    };
-
-    thread::sleep(std::time::Duration::from_millis(
-        fuse_common::TEST_SETUP_DELAY_MS,
-    ));
-
-    let original_file = mountpoint.join("original.txt");
+    let original_file = session.mountpoint.join("original.txt");
     fs::write(&original_file, "shared content").unwrap();
     eprintln!("✓ Created original file");
 
@@ -68,7 +23,7 @@ fn test_fuse_real_hardlink_inodes() {
     let original_ino = original_meta.ino();
     let original_nlink = original_meta.nlink();
 
-    let hardlink_file = mountpoint.join("hardlink.txt");
+    let hardlink_file = session.mountpoint.join("hardlink.txt");
     match fs::hard_link(&original_file, &hardlink_file) {
         Ok(_) => eprintln!("✓ Created hard link"),
         Err(e) => {
@@ -106,70 +61,24 @@ fn test_fuse_real_hardlink_inodes() {
     assert_eq!(orig_content, link_content);
     eprintln!("✓ Both files have identical content");
 
-    drop(handle);
     eprintln!("✓ Hard link inode tracking test completed");
 }
 
 /// Copy_up TOCTOU handling - source file deleted between check and copy
 #[test]
 fn test_fuse_toctou_copy_up_source_deleted() {
-    if !check_macfuse_installed() {
-        eprintln!("Skipping real FUSE test - macFUSE not installed");
-        return;
-    }
-
-    let workspace = TestWorkspace::new();
-    workspace.switch_to_repo();
-
-    let test_name = "toctou-copy-up-source-deleted";
-    let mountpoint = match determine_mount_point(test_name) {
-        Ok(mp) => mp,
-        Err(e) => {
-            eprintln!("Failed to determine mount point: {}", e);
-            workspace.restore_dir();
-            return;
-        }
+    let session = match fuse_common::FuseTestSession::with_lower_layer_setup(
+        "toctou-copy-up-source-deleted",
+        |lower| {
+            let lower_file = lower.join("test.txt");
+            fs::write(&lower_file, "original content").unwrap();
+        },
+    ) {
+        Some(s) => s,
+        None => return,
     };
 
-    let upper_layer = tempfile::tempdir().unwrap().keep();
-    let lower_layer = tempfile::tempdir().unwrap().keep();
-
-    let lower_file = lower_layer.join("test.txt");
-    fs::write(&lower_file, "original content").unwrap();
-
-    let fs = match TreebeardFs::new(upper_layer.clone(), lower_layer.clone(), None, 1, vec![]) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Failed to create TreebeardFs: {}", e);
-            workspace.restore_dir();
-            return;
-        }
-    };
-
-    let _cleanup = fuse_common::MountCleanup::new(mountpoint.clone());
-    let session = match Session::new(fs, &mountpoint, &[]) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to create FUSE session: {}", e);
-            workspace.restore_dir();
-            return;
-        }
-    };
-
-    let handle = match session.spawn() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("Failed to spawn FUSE session: {}", e);
-            workspace.restore_dir();
-            return;
-        }
-    };
-
-    thread::sleep(std::time::Duration::from_millis(
-        fuse_common::TEST_SETUP_DELAY_MS,
-    ));
-
-    let mounted_file = mountpoint.join("test.txt");
+    let mounted_file = session.mountpoint.join("test.txt");
 
     let max_retries = 5;
     for attempt in 0..max_retries {
@@ -182,8 +91,6 @@ fn test_fuse_toctou_copy_up_source_deleted() {
             Err(e) => {
                 if attempt == max_retries - 1 {
                     eprintln!("Failed to read file after {} attempts: {}", max_retries, e);
-                    drop(handle);
-                    workspace.restore_dir();
                     return;
                 }
                 eprintln!("Read attempt {} failed: {}, retrying...", attempt + 1, e);
@@ -192,14 +99,14 @@ fn test_fuse_toctou_copy_up_source_deleted() {
         }
     }
 
-    let upper_path = upper_layer.join("test.txt");
+    let upper_path = session.upper_layer.join("test.txt");
     assert!(
         !upper_path.exists(),
         "File should not exist in upper layer yet"
     );
     eprintln!("✓ Confirmed file not yet in upper layer");
 
-    fs::remove_file(&lower_file).unwrap();
+    fs::remove_file(&session.lower_layer.join("test.txt")).unwrap();
     eprintln!("✓ Deleted source file from lower layer");
 
     let mounted_file_clone = mounted_file.clone();
@@ -215,7 +122,5 @@ fn test_fuse_toctou_copy_up_source_deleted() {
         None => eprintln!("⚠ Access thread panicked or hung"),
     }
 
-    drop(handle);
     eprintln!("✓ TOCTOU copy_up handling test completed");
-    workspace.restore_dir();
 }
