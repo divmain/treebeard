@@ -106,7 +106,7 @@ fn test_fuse_toctou_copy_up_source_deleted() {
     );
     eprintln!("✓ Confirmed file not yet in upper layer");
 
-    fs::remove_file(&session.lower_layer.join("test.txt")).unwrap();
+    fs::remove_file(session.lower_layer.join("test.txt")).unwrap();
     eprintln!("✓ Deleted source file from lower layer");
 
     let mounted_file_clone = mounted_file.clone();

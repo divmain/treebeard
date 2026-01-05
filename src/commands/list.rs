@@ -27,6 +27,12 @@ fn format_age(duration: Duration) -> String {
     }
 }
 
+struct SessionInfo<'a> {
+    session: &'a crate::session::ActiveSession,
+    is_mounted: bool,
+    dirty_files_count: usize,
+}
+
 pub fn list_active_sessions(porcelain: bool, json: bool) -> Result<()> {
     let repo = GitRepo::discover()?;
 
@@ -40,76 +46,75 @@ pub fn list_active_sessions(porcelain: bool, json: bool) -> Result<()> {
         .filter(|s| s.repo_path == repo_path_str)
         .collect();
 
-    if json {
-        let sessions_display: Vec<_> = repo_sessions
-            .iter()
-            .map(|session| {
-                let mount_status = std::path::Path::new(&session.mount_path).exists();
-                let dirty_files_count =
-                    get_worktree_dirty_files_count(Path::new(&session.worktree_path));
+    let session_infos: Vec<_> = repo_sessions
+        .iter()
+        .map(|session| SessionInfo {
+            session,
+            is_mounted: Path::new(&session.mount_path).exists(),
+            dirty_files_count: get_worktree_dirty_files_count(Path::new(&session.worktree_path)),
+        })
+        .collect();
 
+    if json {
+        let sessions_display: Vec<_> = session_infos
+            .iter()
+            .map(|info| {
                 serde_json::json!({
-                    "branch": session.branch_name,
-                    "mount_path": session.mount_path,
-                    "status": if mount_status { "mounted" } else { "unmounted" },
-                    "dirty_files": dirty_files_count,
+                    "branch": info.session.branch_name,
+                    "mount_path": info.session.mount_path,
+                    "status": if info.is_mounted { "mounted" } else { "unmounted" },
+                    "dirty_files": info.dirty_files_count,
                 })
             })
             .collect();
 
         println!("{}", serde_json::to_string(&sessions_display)?);
     } else if porcelain {
-        for session in &repo_sessions {
-            let mount_status = if Path::new(&session.mount_path).exists() {
+        for info in &session_infos {
+            let mount_status = if info.is_mounted {
                 "mounted"
             } else {
                 "unmounted"
             };
 
-            let dirty_files_count =
-                get_worktree_dirty_files_count(Path::new(&session.worktree_path));
-
             println!(
                 "{}\t{}\t{}\t{}",
-                session.branch_name, session.mount_path, mount_status, dirty_files_count
+                info.session.branch_name,
+                info.session.mount_path,
+                mount_status,
+                info.dirty_files_count
             );
         }
     } else {
-        if repo_sessions.is_empty() {
+        if session_infos.is_empty() {
             println!("Active sessions for: {}", repo_name);
             println!();
             println!("  (No active worktrees)");
             return Ok(());
         }
 
-        let sessions_display: Vec<SessionDisplay> = repo_sessions
+        let sessions_display: Vec<SessionDisplay> = session_infos
             .iter()
-            .map(|session| {
-                let mount_path = Path::new(&session.mount_path);
-
-                let mount_status = if mount_path.exists() {
-                    "mounted"
-                } else {
-                    "unmounted"
-                };
-
-                let dirty_files = get_worktree_dirty_files_count(Path::new(&session.worktree_path));
-
-                let status = if session.is_healthy() {
+            .map(|info| {
+                let status = if info.session.is_healthy() {
                     SessionStatus::Idle
                 } else {
                     SessionStatus::Stale
                 };
 
                 let now = chrono::Utc::now();
-                let age = now.signed_duration_since(session.start_time);
+                let age = now.signed_duration_since(info.session.start_time);
                 let age_duration = std::time::Duration::from_secs(age.num_seconds().unsigned_abs());
 
                 SessionDisplay {
-                    branch: session.branch_name.clone(),
+                    branch: info.session.branch_name.clone(),
                     status,
-                    mount_status: mount_status.to_string(),
-                    dirty_files,
+                    mount_status: if info.is_mounted {
+                        "mounted".to_string()
+                    } else {
+                        "unmounted".to_string()
+                    },
+                    dirty_files: info.dirty_files_count,
                     age: age_duration,
                 }
             })
