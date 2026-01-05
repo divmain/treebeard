@@ -1,16 +1,14 @@
 use fuser::FileAttr;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr, OsString};
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
 
 use crate::overlay::convert::{metadata_to_fileattr, std_filetype_to_fuser};
 use crate::overlay::inode_manager::InodeManager;
 use crate::overlay::types::{InodeData, LayerType, MutationType};
+use crate::overlay::whiteout::Whiteout;
 use crate::overlay::TreebeardFs;
 
 impl TreebeardFs {
@@ -172,6 +170,8 @@ impl TreebeardFs {
     ///
     /// This creates an empty file named `.wh.<filename>` in the upper layer's
     /// corresponding directory to mark that the original file should be hidden.
+    ///
+    /// See [`Whiteout`] for more details on whiteout handling.
     pub(crate) fn create_whiteout(
         &mut self,
         parent: u64,
@@ -191,15 +191,7 @@ impl TreebeardFs {
             fs::create_dir_all(&parent_path).map_err(|_| libc::EIO)?;
         }
 
-        // Create .wh.<filename> whiteout marker
-        let mut whiteout_name = OsString::from(".wh.");
-        whiteout_name.push(name);
-        let whiteout_path = parent_path.join(whiteout_name);
-
-        // Create an empty file as the whiteout marker
-        File::create(&whiteout_path).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-
-        Ok(())
+        Whiteout::create(&parent_path, name)
     }
 
     pub(crate) fn do_delete(&mut self, ino: u64) {
@@ -485,28 +477,10 @@ impl TreebeardFs {
 
             // Handle whiteouts only in upper layer
             if layer == LayerType::Upper {
-                #[cfg(unix)]
-                {
-                    let name_bytes = name.as_bytes();
-                    let wh_prefix = b".wh.";
-                    if name_bytes.starts_with(wh_prefix) {
-                        let target_bytes = &name_bytes[wh_prefix.len()..];
-                        let target = OsString::from(OsStr::from_bytes(target_bytes));
-                        entries.remove(&target);
-                        whiteouts.insert(target);
-                        continue;
-                    }
-                }
-
-                #[cfg(not(unix))]
-                {
-                    let name_str = name.to_string_lossy();
-                    if let Some(target_name) = name_str.strip_prefix(".wh.") {
-                        let target = OsString::from(target_name);
-                        entries.remove(&target);
-                        whiteouts.insert(target);
-                        continue;
-                    }
+                if let Some(target) = Whiteout::extract_target(&name) {
+                    entries.remove(&target);
+                    whiteouts.insert(target);
+                    continue;
                 }
             }
 

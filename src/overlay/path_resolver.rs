@@ -1,7 +1,7 @@
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::overlay::types::LayerType;
+use crate::overlay::whiteout::Whiteout;
 
 /// Handles path resolution, passthrough detection, and layer path computation.
 ///
@@ -171,15 +171,10 @@ impl PathResolver {
     ///
     /// For a file at `path`, checks if a whiteout marker exists at `.wh.<filename>`
     /// in the same directory within the upper layer.
+    ///
+    /// See [`Whiteout`] for more details on whiteout handling.
     pub fn is_whiteout(&self, path: &Path) -> bool {
-        if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-            let mut whiteout_name = OsString::from(".wh.");
-            whiteout_name.push(name);
-            let whiteout_path = parent.join(whiteout_name);
-            whiteout_path.exists()
-        } else {
-            false
-        }
+        Whiteout::is_whiteout(path)
     }
 
     /// Check if a file has been whited-out, given a relative path.

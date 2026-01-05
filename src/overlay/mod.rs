@@ -6,6 +6,7 @@ pub mod mount;
 mod path_resolver;
 pub mod setup;
 pub mod types;
+pub mod whiteout;
 
 pub use mount::{cleanup_stale_mounts, perform_fuse_cleanup};
 pub use setup::setup_overlay_and_watcher;
