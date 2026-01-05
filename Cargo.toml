@@ -45,6 +45,7 @@ similar = "2.6"
 lru = "0.16"
 parking_lot = "0.12"
 fxhash = "0.2"
+dashmap = "6.1"
 fs2 = "0.4"
 
 [dev-dependencies]

@@ -2996,6 +2996,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "dashmap",
  "directories",
  "dirs",
  "expectrl",

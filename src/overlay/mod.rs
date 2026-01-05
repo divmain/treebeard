@@ -18,12 +18,13 @@ use inode_manager::InodeManager;
 use path_resolver::PathResolver;
 use types::{InodeData, LayerType};
 
+use dashmap::DashMap;
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow,
     FUSE_ROOT_ID,
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -42,13 +43,18 @@ use std::time::{Duration, SystemTime};
 /// This separation of concerns keeps the FUSE implementation focused on
 /// implementing the Filesystem trait while delegating state management
 /// to dedicated types.
+///
+/// The `file_handles` map uses `DashMap` for lock-free concurrent access,
+/// reducing lock contention in FUSE hot paths. This allows multiple concurrent
+/// file operations without blocking each other on handle lookups.
 pub struct TreebeardFs {
     /// Manages inode allocation, tracking, and lifecycle
     pub(crate) inode_manager: InodeManager,
     /// Handles path resolution and passthrough detection
     pub(crate) path_resolver: PathResolver,
-    /// File handles for open files
-    file_handles: Arc<RwLock<HashMap<u64, FileHandle>>>,
+    /// File handles for open files.
+    /// Uses DashMap for lock-free concurrent access in FUSE hot paths.
+    file_handles: Arc<DashMap<u64, FileHandle>>,
     /// Next file handle to allocate
     next_fh: Arc<Mutex<u64>>,
     /// Tracks all file mutations in the overlay
@@ -76,9 +82,9 @@ impl TreebeardFs {
         let mut fs = TreebeardFs {
             inode_manager,
             path_resolver,
-            file_handles: Arc::new(RwLock::new(HashMap::new())),
+            file_handles: Arc::new(DashMap::new()),
             next_fh: Arc::new(Mutex::new(1)),
-            mutations: Arc::new(RwLock::new(HashMap::new())),
+            mutations: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             mutation_tx,
             ttl: Duration::from_secs(ttl_secs),
         };
@@ -443,7 +449,7 @@ impl Filesystem for TreebeardFs {
             file: Arc::new(Mutex::new(file)),
         };
 
-        self.file_handles.write().insert(fh, handle);
+        self.file_handles.insert(fh, handle);
 
         // Update the inode's layer if it changed (e.g., file was found in different layer)
         self.inode_manager.increment_open_handles(ino);
@@ -471,17 +477,14 @@ impl Filesystem for TreebeardFs {
             offset,
             size
         );
-        // Clone the file handle Arc to release the file_handles lock before I/O.
+        // Clone the file handle Arc to release the DashMap reference before I/O.
         // This prevents slow disk I/O from blocking other file open/close operations.
-        let file_arc = {
-            let handles = self.file_handles.read();
-            match handles.get(&fh) {
-                Some(h) => Arc::clone(&h.file),
-                None => {
-                    tracing::warn!("read: file handle {} not found", fh);
-                    reply.error(libc::EBADF);
-                    return;
-                }
+        let file_arc = match self.file_handles.get(&fh) {
+            Some(h) => Arc::clone(&h.file),
+            None => {
+                tracing::warn!("read: file handle {} not found", fh);
+                reply.error(libc::EBADF);
+                return;
             }
         };
         let mut file = file_arc.lock();
@@ -560,16 +563,13 @@ impl Filesystem for TreebeardFs {
             }
         }
 
-        // Clone the file handle Arc to release the file_handles lock before I/O.
+        // Clone the file handle Arc to release the DashMap reference before I/O.
         // This prevents slow disk I/O from blocking other file open/close operations.
-        let file_arc = {
-            let handles = self.file_handles.read();
-            match handles.get(&fh) {
-                Some(h) => Arc::clone(&h.file),
-                None => {
-                    reply.error(libc::EBADF);
-                    return;
-                }
+        let file_arc = match self.file_handles.get(&fh) {
+            Some(h) => Arc::clone(&h.file),
+            None => {
+                reply.error(libc::EBADF);
+                return;
             }
         };
 
@@ -606,13 +606,11 @@ impl Filesystem for TreebeardFs {
     }
 
     fn flush(&mut self, _req: &Request, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        // Verify the file handle exists
-        let handles = self.file_handles.read();
-        if !handles.contains_key(&fh) {
+        // Verify the file handle exists (lock-free check with DashMap)
+        if !self.file_handles.contains_key(&fh) {
             reply.error(libc::EBADF);
             return;
         }
-        drop(handles);
 
         // Refresh inode attributes from the filesystem as defense-in-depth.
         // This ensures that even if a write path missed updating attributes,
@@ -653,7 +651,7 @@ impl Filesystem for TreebeardFs {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        self.file_handles.write().remove(&fh);
+        self.file_handles.remove(&fh);
 
         // Check deleted status first, before acquiring inodes lock, to avoid
         // nested lock acquisition (which increases contention).
@@ -775,7 +773,7 @@ impl Filesystem for TreebeardFs {
                         let handle = FileHandle {
                             file: Arc::new(Mutex::new(file)),
                         };
-                        self.file_handles.write().insert(fh, handle);
+                        self.file_handles.insert(fh, handle);
 
                         self.inode_manager.increment_open_handles(new_ino);
 

@@ -1,6 +1,6 @@
+use dashmap::{DashMap, DashSet};
 use fuser::{FileAttr, FileType};
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,15 +12,22 @@ use crate::overlay::types::{InodeData, InodeTable, LayerType};
 /// This type encapsulates the single responsibility of tracking inodes,
 /// their attributes, parent-child relationships, open file handles,
 /// and deletion state. It does not perform filesystem I/O.
+///
+/// This type uses lock-free concurrent data structures (DashMap/DashSet)
+/// for the `deleted` set and `copy_up_locks` map to reduce lock contention
+/// in FUSE hot paths. The inode table still uses RwLock because it requires
+/// LRU semantics that DashMap doesn't provide.
 pub struct InodeManager {
     /// The inode table mapping inode numbers to inode data
     pub(crate) inodes: Arc<RwLock<InodeTable>>,
     /// Next inode number to allocate
     next_ino: Arc<Mutex<u64>>,
-    /// Set of inodes that have been deleted but still have open handles
-    deleted: Arc<RwLock<HashSet<u64>>>,
-    /// Per-inode locks for copy-up synchronization
-    pub(crate) copy_up_locks: Arc<RwLock<HashMap<u64, Arc<Mutex<()>>>>>,
+    /// Set of inodes that have been deleted but still have open handles.
+    /// Uses DashSet for lock-free concurrent access in FUSE hot paths.
+    deleted: Arc<DashSet<u64>>,
+    /// Per-inode locks for copy-up synchronization.
+    /// Uses DashMap for lock-free concurrent access in FUSE hot paths.
+    pub(crate) copy_up_locks: Arc<DashMap<u64, Arc<Mutex<()>>>>,
 }
 
 impl InodeManager {
@@ -30,8 +37,8 @@ impl InodeManager {
             inodes: Arc::new(RwLock::new(InodeTable::new())),
             // Start at 2 because FUSE reserves inode 1 (FUSE_ROOT_ID) for the root directory
             next_ino: Arc::new(Mutex::new(2)),
-            deleted: Arc::new(RwLock::new(HashSet::new())),
-            copy_up_locks: Arc::new(RwLock::new(HashMap::new())),
+            deleted: Arc::new(DashSet::new()),
+            copy_up_locks: Arc::new(DashMap::new()),
         }
     }
 
@@ -186,18 +193,21 @@ impl InodeManager {
     }
 
     /// Mark an inode as deleted (has open handles, will be garbage collected later).
+    /// Lock-free operation using DashSet.
     pub fn mark_deleted(&self, ino: u64) {
-        self.deleted.write().insert(ino);
+        self.deleted.insert(ino);
     }
 
     /// Check if an inode is marked as deleted.
+    /// Lock-free operation using DashSet.
     pub fn is_deleted(&self, ino: u64) -> bool {
-        self.deleted.read().contains(&ino)
+        self.deleted.contains(&ino)
     }
 
     /// Remove an inode from the deleted set.
+    /// Lock-free operation using DashSet.
     pub fn unmark_deleted(&self, ino: u64) {
-        self.deleted.write().remove(&ino);
+        self.deleted.remove(&ino);
     }
 
     /// Remove an inode from the table entirely.
@@ -218,17 +228,18 @@ impl InodeManager {
 
     /// Acquire a copy-up lock for an inode.
     /// Returns a clone of the lock Arc that can be locked by the caller.
+    /// Lock-free operation using DashMap.
     pub fn get_copy_up_lock(&self, ino: u64) -> Arc<Mutex<()>> {
-        let mut locks = self.copy_up_locks.write();
-        locks
+        self.copy_up_locks
             .entry(ino)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 
     /// Remove the copy-up lock for an inode after copy-up is complete.
+    /// Lock-free operation using DashMap.
     pub fn remove_copy_up_lock(&self, ino: u64) {
-        self.copy_up_locks.write().remove(&ino);
+        self.copy_up_locks.remove(&ino);
     }
 
     /// Creates a new InodeData with the given parameters.
@@ -287,7 +298,7 @@ impl InodeManager {
     /// Test helper: get the number of copy-up locks.
     #[cfg(test)]
     pub fn copy_up_locks_count(&self) -> usize {
-        self.copy_up_locks.read().len()
+        self.copy_up_locks.len()
     }
 }
 
