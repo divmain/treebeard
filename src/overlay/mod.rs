@@ -1,7 +1,9 @@
 mod convert;
 mod file_handle;
 mod helpers;
+mod inode_manager;
 pub mod mount;
+mod path_resolver;
 pub mod setup;
 pub mod types;
 
@@ -11,7 +13,9 @@ pub use types::{MutationTracker, MutationType};
 
 use convert::{io_error_to_libc, metadata_to_fileattr};
 use file_handle::{FileHandle, READ_BUFFER};
-use types::{InodeData, InodeTable, LayerType};
+use inode_manager::InodeManager;
+use path_resolver::PathResolver;
+use types::{InodeData, LayerType};
 
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
@@ -28,16 +32,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+/// The main FUSE filesystem implementation for treebeard.
+///
+/// TreebeardFs acts as a thin coordinator that delegates to specialized components:
+/// - `InodeManager`: Handles inode allocation, tracking, and lifecycle
+/// - `PathResolver`: Handles path resolution and passthrough detection
+///
+/// This separation of concerns keeps the FUSE implementation focused on
+/// implementing the Filesystem trait while delegating state management
+/// to dedicated types.
 pub struct TreebeardFs {
-    pub(crate) upper_layer: PathBuf,
-    pub(crate) lower_layer: PathBuf,
-    pub(crate) inodes: Arc<RwLock<InodeTable>>,
-    next_ino: Arc<Mutex<u64>>,
-    deleted: Arc<RwLock<HashSet<u64>>>,
+    /// Manages inode allocation, tracking, and lifecycle
+    pub(crate) inode_manager: InodeManager,
+    /// Handles path resolution and passthrough detection
+    pub(crate) path_resolver: PathResolver,
+    /// File handles for open files
     file_handles: Arc<RwLock<HashMap<u64, FileHandle>>>,
+    /// Next file handle to allocate
     next_fh: Arc<Mutex<u64>>,
+    /// Tracks all file mutations in the overlay
     pub(crate) mutations: MutationTracker,
-    pub(crate) copy_up_locks: Arc<RwLock<HashMap<u64, Arc<Mutex<()>>>>>,
     /// Channel for signaling file mutations to the commit task.
     /// Unbounded because mutation events should never block FUSE operations.
     mutation_tx: Option<tokio::sync::mpsc::UnboundedSender<PathBuf>>,
@@ -45,8 +59,6 @@ pub struct TreebeardFs {
     /// Higher values reduce kernel-userspace round trips but may delay visibility
     /// of external filesystem changes.
     ttl: Duration,
-    /// Glob patterns for paths that bypass the upper layer entirely.
-    passthrough_patterns: Vec<glob::Pattern>,
 }
 
 impl TreebeardFs {
@@ -57,32 +69,17 @@ impl TreebeardFs {
         ttl_secs: u64,
         passthrough_patterns: Vec<String>,
     ) -> crate::error::Result<Self> {
-        let compiled_patterns = passthrough_patterns
-            .into_iter()
-            .map(|p| {
-                glob::Pattern::new(&p).map_err(|e| {
-                    crate::error::TreebeardError::Config(format!(
-                        "Invalid passthrough glob pattern '{}': {}",
-                        p, e
-                    ))
-                })
-            })
-            .collect::<crate::error::Result<Vec<glob::Pattern>>>()?;
+        let path_resolver = PathResolver::new(upper_layer, lower_layer, passthrough_patterns)?;
+        let inode_manager = InodeManager::new();
 
         let mut fs = TreebeardFs {
-            upper_layer,
-            lower_layer,
-            inodes: Arc::new(RwLock::new(InodeTable::new())),
-            // Start at 2 because FUSE reserves inode 1 (FUSE_ROOT_ID) for the root directory
-            next_ino: Arc::new(Mutex::new(2)),
-            deleted: Arc::new(RwLock::new(HashSet::new())),
+            inode_manager,
+            path_resolver,
             file_handles: Arc::new(RwLock::new(HashMap::new())),
             next_fh: Arc::new(Mutex::new(1)),
             mutations: Arc::new(RwLock::new(HashMap::new())),
-            copy_up_locks: Arc::new(RwLock::new(HashMap::new())),
             mutation_tx,
             ttl: Duration::from_secs(ttl_secs),
-            passthrough_patterns: compiled_patterns,
         };
 
         fs.initialize_root()?;
@@ -91,7 +88,7 @@ impl TreebeardFs {
 
     #[cfg(test)]
     pub fn copy_up_locks_count(&self) -> usize {
-        self.copy_up_locks.read().len()
+        self.inode_manager.copy_up_locks_count()
     }
 
     /// Signal that a file was mutated. Called from FUSE callbacks.
@@ -105,33 +102,34 @@ impl TreebeardFs {
     }
 
     fn initialize_root(&mut self) -> crate::error::Result<()> {
-        let root_attrs = if self.upper_layer.exists() {
-            fs::metadata(&self.upper_layer).map_err(|e| {
+        let upper_layer = &self.path_resolver.upper_layer;
+        let root_attrs = if upper_layer.exists() {
+            fs::metadata(upper_layer).map_err(|e| {
                 crate::error::TreebeardError::Config(format!(
                     "Failed to get metadata for {}: {}",
-                    self.upper_layer.display(),
+                    upper_layer.display(),
                     e
                 ))
             })?
         } else {
-            fs::create_dir_all(&self.upper_layer).map_err(|e| {
+            fs::create_dir_all(upper_layer).map_err(|e| {
                 crate::error::TreebeardError::Config(format!(
                     "Failed to create directory {}: {}",
-                    self.upper_layer.display(),
+                    upper_layer.display(),
                     e
                 ))
             })?;
-            fs::metadata(&self.upper_layer).map_err(|e| {
+            fs::metadata(upper_layer).map_err(|e| {
                 crate::error::TreebeardError::Config(format!(
                     "Failed to get metadata for {}: {}",
-                    self.upper_layer.display(),
+                    upper_layer.display(),
                     e
                 ))
             })?
         };
 
         let file_attrs = metadata_to_fileattr(&root_attrs, FUSE_ROOT_ID);
-        let inode = Self::create_inode_data(
+        let inode = InodeManager::create_inode_data(
             FUSE_ROOT_ID,
             0,
             OsString::new(),
@@ -140,18 +138,8 @@ impl TreebeardFs {
             file_attrs,
         );
 
-        self.inodes.write().insert(inode);
+        self.inode_manager.insert(inode);
         Ok(())
-    }
-
-    pub(crate) fn alloc_inode(&self) -> u64 {
-        let mut next = self.next_ino.lock();
-        let ino = *next;
-        // wrapping_add handles overflow gracefully - if we ever exhaust u64 (unlikely),
-        // we wrap to 0 rather than panicking. This is acceptable since very old inodes
-        // will have been freed by then.
-        *next = next.wrapping_add(1);
-        ino
     }
 
     fn alloc_fh(&self) -> u64 {
@@ -182,18 +170,11 @@ impl Filesystem for TreebeardFs {
         // The kernel is releasing nlookup references to this inode.
         // We track open file handles separately, so we only need to check
         // if the inode should be garbage collected when it's in the deleted set.
-        let should_gc = {
-            let inodes = self.inodes.read();
-            if let Some(inode) = inodes.peek(ino) {
-                inode.hardlinks == 0 && inode.open_file_handles == 0
-            } else {
-                false
-            }
-        };
+        let should_gc = self.inode_manager.should_gc(ino);
 
-        if should_gc && self.deleted.read().contains(&ino) {
+        if should_gc && self.inode_manager.is_deleted(ino) {
             self.do_gc(ino);
-            self.deleted.write().remove(&ino);
+            self.inode_manager.unmark_deleted(ino);
         }
     }
 
@@ -201,10 +182,7 @@ impl Filesystem for TreebeardFs {
         tracing::debug!("lookup(parent={}, name={:?})", parent, name);
 
         // First check if we already have this inode cached
-        let cached_ino = {
-            let inodes = self.inodes.read();
-            inodes.lookup_child(parent, name)
-        };
+        let cached_ino = self.inode_manager.lookup_child(parent, name);
 
         if let Some(ino) = cached_ino {
             tracing::debug!("lookup: found cached inode {} for {:?}", ino, name);
@@ -222,15 +200,12 @@ impl Filesystem for TreebeardFs {
         );
 
         // Get the parent path
-        let parent_inode_path = {
-            let inodes = self.inodes.read();
-            match inodes.peek(parent) {
-                Some(i) => i.path.clone(),
-                None => {
-                    tracing::warn!("lookup: parent inode {} not found", parent);
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+        let parent_inode_path = match self.inode_manager.get_path(parent) {
+            Some(path) => path,
+            None => {
+                tracing::warn!("lookup: parent inode {} not found", parent);
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
@@ -243,7 +218,7 @@ impl Filesystem for TreebeardFs {
         {
             match result {
                 Ok((inode, file_attrs)) => {
-                    self.inodes.write().insert(inode);
+                    self.inode_manager.insert(inode);
                     reply.entry(&self.ttl, &file_attrs, 0);
                 }
                 Err(errno) => reply.error(errno),
@@ -254,7 +229,7 @@ impl Filesystem for TreebeardFs {
         // Use standard overlay lookup (upper shadows lower)
         match self.lookup_overlay(parent, child_name, relative_path.clone()) {
             Ok(Some((inode, file_attrs))) => {
-                self.inodes.write().insert(inode);
+                self.inode_manager.insert(inode);
                 reply.entry(&self.ttl, &file_attrs, 0);
             }
             Ok(None) => {
@@ -267,17 +242,10 @@ impl Filesystem for TreebeardFs {
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         tracing::trace!("getattr(ino={})", ino);
-        let inodes = self.inodes.read();
 
-        if let Some(inode) = inodes.peek(ino) {
-            tracing::trace!(
-                "getattr: ino={} -> path={:?}, layer={:?}, size={}",
-                ino,
-                inode.path,
-                inode.layer,
-                inode.attrs.size
-            );
-            reply.attr(&self.ttl, &inode.attrs);
+        if let Some(attrs) = self.inode_manager.get_attrs(ino) {
+            tracing::trace!("getattr: ino={} -> size={}", ino, attrs.size);
+            reply.attr(&self.ttl, &attrs);
         } else {
             tracing::warn!("getattr: inode {} not found", ino);
             reply.error(libc::ENOENT);
@@ -302,12 +270,12 @@ impl Filesystem for TreebeardFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let Some((rel_path, _layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((rel_path, _layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let is_passthrough = self.is_passthrough(&rel_path);
+        let is_passthrough = self.path_resolver.is_passthrough(&rel_path);
 
         if !is_passthrough {
             if let Err(e) = self.copy_up(ino) {
@@ -316,9 +284,9 @@ impl Filesystem for TreebeardFs {
             }
         }
 
-        let inodes = self.inodes.read();
+        let inodes = self.inode_manager.inodes.read();
         if let Some(inode) = inodes.peek(ino) {
-            let base = self.layer_base_path(inode.layer);
+            let base = self.path_resolver.layer_base_path(inode.layer);
             let path = base.join(&inode.path);
             drop(inodes);
 
@@ -331,7 +299,7 @@ impl Filesystem for TreebeardFs {
             match fs::metadata(&path) {
                 Ok(attrs) => {
                     let file_attrs = metadata_to_fileattr(&attrs, ino);
-                    self.inodes.write().update_attrs(ino, file_attrs);
+                    self.inode_manager.update_attrs(ino, file_attrs);
                     reply.attr(&self.ttl, &file_attrs);
                 }
                 Err(e) => reply.error(io_error_to_libc(&e)),
@@ -359,16 +327,9 @@ impl Filesystem for TreebeardFs {
         // Acquire the copy-up lock for this inode before checking the layer.
         // This prevents race conditions where another thread could delete or
         // modify the file between the layer check and the file open.
-        use std::sync::Arc;
-        let copy_up_lock = {
-            let mut locks = self.copy_up_locks.write();
-            locks
-                .entry(ino)
-                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
-                .clone()
-        };
+        let copy_up_lock = self.inode_manager.get_copy_up_lock(ino);
 
-        let Some((rel_path, layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((rel_path, layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             tracing::warn!("open: inode {} not found in table", ino);
             reply.error(libc::ENOENT);
             return;
@@ -387,7 +348,7 @@ impl Filesystem for TreebeardFs {
         tracing::debug!("open: wants_write={}", wants_write);
 
         // Check if this is a passthrough file (writes go directly to lower layer, no copy-up)
-        let is_passthrough = self.is_passthrough(&rel_path);
+        let is_passthrough = self.path_resolver.is_passthrough(&rel_path);
 
         // If file is in lower layer and write access is requested, do COW first
         // (but NOT for passthrough files, which write directly to lower layer)
@@ -405,7 +366,7 @@ impl Filesystem for TreebeardFs {
 
         // Get the actual path and verify the current layer (in case copy_up changed it)
         let (actual_path, current_layer) = {
-            let inodes = self.inodes.read();
+            let inodes = self.inode_manager.inodes.read();
             if let Some(inode) = inodes.peek(ino) {
                 // Use resolve_path to find where the file actually exists
                 // This handles cases where the inode's layer might be stale
@@ -414,7 +375,7 @@ impl Filesystem for TreebeardFs {
                     inode.path,
                     inode.layer
                 );
-                match self.resolve_path(&inode.path, inode.layer) {
+                match self.path_resolver.resolve_path(&inode.path, inode.layer) {
                     Some((path, actual_layer)) => {
                         tracing::debug!(
                             "open: resolve_path returned path={}, layer={:?}",
@@ -425,7 +386,10 @@ impl Filesystem for TreebeardFs {
                     }
                     None => {
                         // Fall back to computing path from inode's layer
-                        let fallback_path = self.layer_base_path(inode.layer).join(&inode.path);
+                        let fallback_path = self
+                            .path_resolver
+                            .layer_base_path(inode.layer)
+                            .join(&inode.path);
                         tracing::warn!(
                             "open: resolve_path returned None, falling back to {}",
                             fallback_path.display()
@@ -481,21 +445,9 @@ impl Filesystem for TreebeardFs {
         self.file_handles.write().insert(fh, handle);
 
         // Update the inode's layer if it changed (e.g., file was found in different layer)
-        {
-            let mut inodes = self.inodes.write();
-            if let Some(inode) = inodes.get_mut(ino) {
-                inode.open_file_handles += 1;
-                if inode.layer != current_layer {
-                    tracing::debug!(
-                        "Correcting layer for inode {}: {:?} -> {:?}",
-                        ino,
-                        inode.layer,
-                        current_layer
-                    );
-                    inode.layer = current_layer;
-                }
-            }
-        }
+        self.inode_manager.increment_open_handles(ino);
+        self.inode_manager
+            .update_layer_if_needed(ino, current_layer);
 
         reply.opened(fh, 0);
     }
@@ -585,7 +537,7 @@ impl Filesystem for TreebeardFs {
             data.len()
         );
 
-        let Some((rel_path, layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((rel_path, layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             tracing::warn!("write: inode {} not found", ino);
             reply.error(libc::ENOENT);
             return;
@@ -598,7 +550,7 @@ impl Filesystem for TreebeardFs {
             layer
         );
 
-        if layer == LayerType::Lower && !self.is_passthrough(&rel_path) {
+        if layer == LayerType::Lower && !self.path_resolver.is_passthrough(&rel_path) {
             tracing::debug!("write: performing copy-up for lower layer file");
             if let Err(e) = self.copy_up(ino) {
                 tracing::error!("write: copy-up failed with error {}", e);
@@ -637,14 +589,10 @@ impl Filesystem for TreebeardFs {
                 // Update the inode size incrementally based on the write offset and size
                 // to avoid expensive stat() syscall on every write. The size is refreshed
                 // from the filesystem on flush() for accuracy.
-                {
-                    let inodes = self.inodes.read();
-                    if let Some(inode) = inodes.peek(ino) {
-                        let new_size = std::cmp::max(inode.attrs.size, offset as u64 + n as u64);
-                        drop(inodes);
-                        self.inodes.write().update_size(ino, new_size);
-                        tracing::debug!("write: updated inode {} size to {}", ino, new_size);
-                    }
+                if let Some(attrs) = self.inode_manager.get_attrs(ino) {
+                    let new_size = std::cmp::max(attrs.size, offset as u64 + n as u64);
+                    self.inode_manager.update_size(ino, new_size);
+                    tracing::debug!("write: updated inode {} size to {}", ino, new_size);
                 }
 
                 reply.written(n as u32);
@@ -669,14 +617,14 @@ impl Filesystem for TreebeardFs {
         // This ensures that even if a write path missed updating attributes,
         // the correct size will be visible after flush.
 
-        if let Some((rel_path, layer, _has_open)) = self.get_inode_info(ino) {
-            let is_passthrough = self.is_passthrough(&rel_path);
+        if let Some((rel_path, layer, _has_open)) = self.inode_manager.get_inode_info(ino) {
+            let is_passthrough = self.path_resolver.is_passthrough(&rel_path);
             if layer == LayerType::Upper || is_passthrough {
-                let base = self.layer_base_path(layer);
+                let base = self.path_resolver.layer_base_path(layer);
                 let actual_path = base.join(&rel_path);
                 if let Ok(metadata) = fs::metadata(&actual_path) {
                     let new_attrs = metadata_to_fileattr(&metadata, ino);
-                    self.inodes.write().update_attrs(ino, new_attrs);
+                    self.inode_manager.update_attrs(ino, new_attrs);
                     tracing::trace!(
                         "flush: refreshed inode {} attrs, size={}",
                         ino,
@@ -708,21 +656,12 @@ impl Filesystem for TreebeardFs {
 
         // Check deleted status first, before acquiring inodes lock, to avoid
         // nested lock acquisition (which increases contention).
-        let is_deleted = self.deleted.read().contains(&ino);
-
-        let should_gc = {
-            let mut inodes = self.inodes.write();
-            if let Some(inode) = inodes.get_mut(ino) {
-                inode.open_file_handles = inode.open_file_handles.saturating_sub(1);
-                inode.hardlinks == 0 && inode.open_file_handles == 0
-            } else {
-                false
-            }
-        };
+        let is_deleted = self.inode_manager.is_deleted(ino);
+        let should_gc = self.inode_manager.decrement_open_handles(ino);
 
         if should_gc && is_deleted {
             self.do_gc(ino);
-            self.deleted.write().remove(&ino);
+            self.inode_manager.unmark_deleted(ino);
         }
 
         reply.ok();
@@ -745,7 +684,7 @@ impl Filesystem for TreebeardFs {
             mode
         );
         let (parent_path, is_passthrough) = {
-            let inodes = self.inodes.read();
+            let inodes = self.inode_manager.inodes.read();
             let parent_inode = match inodes.peek(parent) {
                 Some(i) => i.path.clone(),
                 None => {
@@ -762,7 +701,7 @@ impl Filesystem for TreebeardFs {
             }
 
             let rel_path = parent_inode.join(name);
-            let is_pt = self.is_passthrough(&rel_path);
+            let is_pt = self.path_resolver.is_passthrough(&rel_path);
             (parent_inode, is_pt)
         };
 
@@ -771,7 +710,7 @@ impl Filesystem for TreebeardFs {
         } else {
             LayerType::Upper
         };
-        let base_path = self.layer_base_path(layer);
+        let base_path = self.path_resolver.layer_base_path(layer);
         let child_path = base_path.join(&parent_path).join(name);
 
         tracing::debug!(
@@ -804,11 +743,11 @@ impl Filesystem for TreebeardFs {
 
         match fs::metadata(&child_path) {
             Ok(attrs) => {
-                let new_ino = self.alloc_inode();
+                let new_ino = self.inode_manager.alloc_inode();
                 let file_attrs = metadata_to_fileattr(&attrs, new_ino);
                 let relative_path = parent_path.join(name);
 
-                let inode = Self::create_inode_data(
+                let inode = InodeManager::create_inode_data(
                     new_ino,
                     parent,
                     name.to_os_string(),
@@ -817,7 +756,7 @@ impl Filesystem for TreebeardFs {
                     file_attrs,
                 );
 
-                self.inodes.write().insert(inode);
+                self.inode_manager.insert(inode);
 
                 if !is_passthrough {
                     self.mutations
@@ -837,12 +776,7 @@ impl Filesystem for TreebeardFs {
                         };
                         self.file_handles.write().insert(fh, handle);
 
-                        {
-                            let mut inodes = self.inodes.write();
-                            if let Some(inode) = inodes.get_mut(new_ino) {
-                                inode.open_file_handles += 1;
-                            }
-                        }
+                        self.inode_manager.increment_open_handles(new_ino);
 
                         reply.created(&self.ttl, &file_attrs, 0, fh, flags as u32);
                     }
@@ -854,10 +788,7 @@ impl Filesystem for TreebeardFs {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let lookup_result = {
-            let inodes = self.inodes.read();
-            inodes.lookup_child(parent, name)
-        };
+        let lookup_result = self.inode_manager.lookup_child(parent, name);
         let ino = match lookup_result {
             Some(ino) => ino,
             None => {
@@ -866,12 +797,12 @@ impl Filesystem for TreebeardFs {
             }
         };
 
-        let Some((rel_path, layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((rel_path, layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let is_passthrough = self.is_passthrough(&rel_path);
+        let is_passthrough = self.path_resolver.is_passthrough(&rel_path);
 
         if layer == LayerType::Lower && !is_passthrough {
             self.mutations
@@ -896,10 +827,7 @@ impl Filesystem for TreebeardFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let lookup_result = {
-            let inodes = self.inodes.read();
-            inodes.lookup_child(parent, name)
-        };
+        let lookup_result = self.inode_manager.lookup_child(parent, name);
         let ino = match lookup_result {
             Some(ino) => ino,
             None => {
@@ -908,28 +836,30 @@ impl Filesystem for TreebeardFs {
             }
         };
 
+        if self
+            .inode_manager
+            .lookup_child(newparent, newname)
+            .is_some()
         {
-            let inodes = self.inodes.read();
-            if inodes.lookup_child(newparent, newname).is_some() {
-                reply.error(libc::EEXIST);
-                return;
-            }
+            reply.error(libc::EEXIST);
+            return;
         }
 
-        let Some((rel_path, _layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((rel_path, _layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let Some((new_parent_rel_path, _, _new_parent_has_open)) = self.get_inode_info(newparent)
+        let Some((new_parent_rel_path, _, _new_parent_has_open)) =
+            self.inode_manager.get_inode_info(newparent)
         else {
             reply.error(libc::ENOENT);
             return;
         };
 
         let new_rel_path = new_parent_rel_path.join(newname);
-        let src_is_passthrough = self.is_passthrough(&rel_path);
-        let dest_is_passthrough = self.is_passthrough(&new_rel_path);
+        let src_is_passthrough = self.path_resolver.is_passthrough(&rel_path);
+        let dest_is_passthrough = self.path_resolver.is_passthrough(&new_rel_path);
 
         // If either is passthrough, we operate on lower layer and skip COW
         if !src_is_passthrough && !dest_is_passthrough {
@@ -941,7 +871,7 @@ impl Filesystem for TreebeardFs {
 
         // Get source and dest paths in one block to avoid borrow issues
         let (src_path, dest_path, new_parent_path, old_relative_path, actual_layer) = {
-            let inodes = self.inodes.read();
+            let inodes = self.inode_manager.inodes.read();
             let inode = inodes.peek(ino);
             let newparent_inode = inodes.peek(newparent);
 
@@ -952,7 +882,7 @@ impl Filesystem for TreebeardFs {
                     } else {
                         LayerType::Upper
                     };
-                    let base = self.layer_base_path(layer);
+                    let base = self.path_resolver.layer_base_path(layer);
                     let src = base.join(&i.path);
                     let dest = base.join(&np.path).join(newname);
                     let parent_path = np.path.clone();
@@ -974,17 +904,15 @@ impl Filesystem for TreebeardFs {
 
         let new_relative_path = new_parent_path.join(newname);
 
-        {
-            let mut inodes = self.inodes.write();
-            inodes.remove_child(parent, name);
-            inodes.add_child(newparent, newname.to_os_string(), ino);
-            if let Some(inode) = inodes.get_mut(ino) {
-                inode.path = new_relative_path.clone();
-                inode.parent = newparent;
-                inode.name = newname.to_os_string();
-                inode.layer = actual_layer;
-            }
-        }
+        self.inode_manager.update_after_rename(
+            ino,
+            parent,
+            name,
+            newparent,
+            newname.to_os_string(),
+            new_relative_path.clone(),
+            actual_layer,
+        );
 
         if !src_is_passthrough && !dest_is_passthrough {
             // Signal both old and new paths for rename
@@ -1004,14 +932,14 @@ impl Filesystem for TreebeardFs {
         mut reply: ReplyDirectory,
     ) {
         tracing::debug!("readdir(ino={}, offset={})", ino, offset);
-        let Some((dir_path, _layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((dir_path, _layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             tracing::warn!("readdir: inode {} not found", ino);
             reply.error(libc::ENOENT);
             return;
         };
 
         tracing::debug!("readdir: dir_path={:?}", dir_path);
-        let is_passthrough = self.is_passthrough(&dir_path);
+        let is_passthrough = self.path_resolver.is_passthrough(&dir_path);
 
         // Collect entries from both layers, keyed by name
         // Value is (inode_number, file_type, layer_type)
@@ -1027,7 +955,7 @@ impl Filesystem for TreebeardFs {
         let mut layer_updates: Vec<(u64, FileAttr)> = Vec::new();
 
         // Scan lower layer first, then upper layer (upper overwrites lower entries)
-        let lower_dir = self.lower_layer.join(&dir_path);
+        let lower_dir = self.path_resolver.lower_path(&dir_path);
         self.scan_directory_layer(
             &lower_dir,
             LayerType::Lower,
@@ -1040,7 +968,7 @@ impl Filesystem for TreebeardFs {
         );
 
         if !is_passthrough {
-            let upper_dir = self.upper_layer.join(&dir_path);
+            let upper_dir = self.path_resolver.upper_path(&dir_path);
             self.scan_directory_layer(
                 &upper_dir,
                 LayerType::Upper,
@@ -1055,7 +983,7 @@ impl Filesystem for TreebeardFs {
 
         // Batch insert all new inodes with a single write lock
         if !new_inodes.is_empty() || !layer_updates.is_empty() {
-            let mut inodes = self.inodes.write();
+            let mut inodes = self.inode_manager.inodes.write();
             for inode in new_inodes {
                 inodes.insert(inode);
             }
@@ -1089,9 +1017,8 @@ impl Filesystem for TreebeardFs {
             // This is a defensive check for cross-platform compatibility; our primary
             // whiteout mechanism uses AUFS-style .wh.* prefix files.
             if file_type == FileType::CharDevice {
-                let inodes = self.inodes.read();
-                if let Some(inode) = inodes.peek(child_ino) {
-                    if inode.attrs.rdev == 0 {
+                if let Some(attrs) = self.inode_manager.get_attrs(child_ino) {
+                    if attrs.rdev == 0 {
                         idx += 1;
                         continue;
                     }
@@ -1116,28 +1043,26 @@ impl Filesystem for TreebeardFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let Some((parent_path, _layer, _has_open)) = self.get_inode_info(parent) else {
+        let Some((parent_path, _layer, _has_open)) = self.inode_manager.get_inode_info(parent)
+        else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        {
-            let inodes = self.inodes.read();
-            if inodes.lookup_child(parent, name).is_some() {
-                reply.error(libc::EEXIST);
-                return;
-            }
+        if self.inode_manager.lookup_child(parent, name).is_some() {
+            reply.error(libc::EEXIST);
+            return;
         }
 
         let rel_path = parent_path.join(name);
-        let is_passthrough = self.is_passthrough(&rel_path);
+        let is_passthrough = self.path_resolver.is_passthrough(&rel_path);
 
         let layer = if is_passthrough {
             LayerType::Lower
         } else {
             LayerType::Upper
         };
-        let base_path = self.layer_base_path(layer);
+        let base_path = self.path_resolver.layer_base_path(layer);
         let child_path = base_path.join(&parent_path).join(name);
 
         if let Err(e) = fs::create_dir(&child_path) {
@@ -1148,11 +1073,11 @@ impl Filesystem for TreebeardFs {
 
         match fs::metadata(&child_path) {
             Ok(attrs) => {
-                let new_ino = self.alloc_inode();
+                let new_ino = self.inode_manager.alloc_inode();
                 let file_attrs = metadata_to_fileattr(&attrs, new_ino);
                 let relative_path = parent_path.join(name);
 
-                let inode = Self::create_inode_data(
+                let inode = InodeManager::create_inode_data(
                     new_ino,
                     parent,
                     name.to_os_string(),
@@ -1161,7 +1086,7 @@ impl Filesystem for TreebeardFs {
                     file_attrs,
                 );
 
-                self.inodes.write().insert(inode);
+                self.inode_manager.insert(inode);
 
                 if !is_passthrough {
                     // Signal that a new directory was created
@@ -1182,20 +1107,18 @@ impl Filesystem for TreebeardFs {
         link: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        let Some((parent_path, _layer, _has_open)) = self.get_inode_info(parent) else {
+        let Some((parent_path, _layer, _has_open)) = self.inode_manager.get_inode_info(parent)
+        else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        {
-            let inodes = self.inodes.read();
-            if inodes.lookup_child(parent, name).is_some() {
-                reply.error(libc::EEXIST);
-                return;
-            }
+        if self.inode_manager.lookup_child(parent, name).is_some() {
+            reply.error(libc::EEXIST);
+            return;
         }
 
-        let child_path = self.upper_layer.join(&parent_path).join(name);
+        let child_path = self.path_resolver.upper_path(&parent_path).join(name);
 
         if let Err(e) = std::os::unix::fs::symlink(link, &child_path) {
             tracing::error!("symlink error: {}", e);
@@ -1205,11 +1128,11 @@ impl Filesystem for TreebeardFs {
 
         match fs::symlink_metadata(&child_path) {
             Ok(attrs) => {
-                let new_ino = self.alloc_inode();
+                let new_ino = self.inode_manager.alloc_inode();
                 let file_attrs = metadata_to_fileattr(&attrs, new_ino);
                 let relative_path = parent_path.join(name);
 
-                let inode = Self::create_inode_data(
+                let inode = InodeManager::create_inode_data(
                     new_ino,
                     parent,
                     name.to_os_string(),
@@ -1218,7 +1141,7 @@ impl Filesystem for TreebeardFs {
                     file_attrs,
                 );
 
-                self.inodes.write().insert(inode);
+                self.inode_manager.insert(inode);
                 reply.entry(&self.ttl, &file_attrs, 0);
             }
             Err(e) => reply.error(io_error_to_libc(&e)),
@@ -1226,12 +1149,12 @@ impl Filesystem for TreebeardFs {
     }
 
     fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
-        let Some((rel_path, layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((rel_path, layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let path = self.layer_base_path(layer).join(&rel_path);
+        let path = self.path_resolver.layer_base_path(layer).join(&rel_path);
 
         match fs::read_link(&path) {
             Ok(target) => {
@@ -1256,15 +1179,16 @@ impl Filesystem for TreebeardFs {
         reply: ReplyEntry,
     ) {
         // Check if target doesn't already exist
+        if self
+            .inode_manager
+            .lookup_child(newparent, newname)
+            .is_some()
         {
-            let inodes = self.inodes.read();
-            if inodes.lookup_child(newparent, newname).is_some() {
-                reply.error(libc::EEXIST);
-                return;
-            }
+            reply.error(libc::EEXIST);
+            return;
         }
 
-        let Some((_path, layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((_path, layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
@@ -1279,14 +1203,14 @@ impl Filesystem for TreebeardFs {
 
         // Get the actual path in upper layer and new parent path
         let (src_actual_path, dest_actual_path) = {
-            let inodes = self.inodes.read();
+            let inodes = self.inode_manager.inodes.read();
             let src_inode = inodes.peek(ino);
             let newparent_inode = inodes.peek(newparent);
 
             match (src_inode, newparent_inode) {
                 (Some(s), Some(np)) => {
-                    let src = self.upper_layer.join(&s.path);
-                    let dest = self.upper_layer.join(&np.path).join(newname);
+                    let src = self.path_resolver.upper_path(&s.path);
+                    let dest = self.path_resolver.upper_path(&np.path).join(newname);
                     (src, dest)
                 }
                 _ => {
@@ -1305,18 +1229,15 @@ impl Filesystem for TreebeardFs {
 
         // Create directory entry pointing to SAME inode (reuse existing ino)
         // and increment hardlink count
-        {
-            let mut inodes = self.inodes.write();
-            inodes.add_child(newparent, newname.to_os_string(), ino);
-            if let Some(inode) = inodes.get_mut(ino) {
-                inode.hardlinks += 1;
-                inode.attrs.nlink += 1; // Update the cached nlink so getattr returns correct value
-                reply.entry(&self.ttl, &inode.attrs, 0);
-                return;
-            }
-        }
+        self.inode_manager
+            .add_child(newparent, newname.to_os_string(), ino);
+        self.inode_manager.increment_hardlinks(ino);
 
-        reply.error(libc::ENOENT);
+        if let Some(attrs) = self.inode_manager.get_attrs(ino) {
+            reply.entry(&self.ttl, &attrs, 0);
+        } else {
+            reply.error(libc::ENOENT);
+        }
     }
 
     fn setxattr(
@@ -1335,12 +1256,12 @@ impl Filesystem for TreebeardFs {
             return;
         }
 
-        let Some((rel_path, _layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((rel_path, _layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let path = self.upper_layer.join(&rel_path);
+        let path = self.path_resolver.upper_path(&rel_path);
 
         match xattr::set(&path, name, value) {
             Ok(_) => reply.ok(),
@@ -1349,12 +1270,12 @@ impl Filesystem for TreebeardFs {
     }
 
     fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
-        let Some((rel_path, layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((rel_path, layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let path = self.layer_base_path(layer).join(&rel_path);
+        let path = self.path_resolver.layer_base_path(layer).join(&rel_path);
 
         match xattr::get(&path, name) {
             Ok(Some(value)) => {
@@ -1378,12 +1299,12 @@ impl Filesystem for TreebeardFs {
     }
 
     fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
-        let Some((rel_path, layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((rel_path, layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let path = self.layer_base_path(layer).join(&rel_path);
+        let path = self.path_resolver.layer_base_path(layer).join(&rel_path);
 
         match xattr::list(&path) {
             Ok(attrs) => {
@@ -1412,12 +1333,12 @@ impl Filesystem for TreebeardFs {
             return;
         }
 
-        let Some((rel_path, _layer, _has_open)) = self.get_inode_info(ino) else {
+        let Some((rel_path, _layer, _has_open)) = self.inode_manager.get_inode_info(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let path = self.upper_layer.join(&rel_path);
+        let path = self.path_resolver.upper_path(&rel_path);
 
         match xattr::remove(&path, name) {
             Ok(_) => reply.ok(),

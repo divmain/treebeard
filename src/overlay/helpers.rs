@@ -1,4 +1,4 @@
-use fuser::{FileAttr, FileType};
+use fuser::FileAttr;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::os::unix::ffi::OsStrExt;
 
 use crate::overlay::convert::{metadata_to_fileattr, std_filetype_to_fuser};
+use crate::overlay::inode_manager::InodeManager;
 use crate::overlay::types::{InodeData, LayerType, MutationType};
 use crate::overlay::TreebeardFs;
 
@@ -44,23 +45,19 @@ impl TreebeardFs {
     /// This is used by `open()` which holds the lock through the entire operation
     /// to prevent race conditions between checking the layer and opening the file.
     pub(crate) fn copy_up_internal(&mut self, ino: u64) -> Result<(), i32> {
-        {
-            let inodes = self.inodes.read();
-            if let Some(inode) = inodes.peek(ino) {
-                if inode.layer == LayerType::Upper {
-                    return Ok(());
-                }
-            }
+        // Check if already in upper layer
+        if self.inode_manager.is_in_upper_layer(ino) {
+            return Ok(());
         }
 
         let src_info = {
-            let inodes = self.inodes.read();
+            let inodes = self.inode_manager.inodes.read();
             let inode = inodes.peek(ino).ok_or(libc::ENOENT)?;
             (inode.path.clone(), inode.name.clone(), inode.attrs)
         };
 
-        let src_path = self.lower_layer.join(&src_info.0);
-        let dest_path = self.upper_layer.join(&src_info.0);
+        let src_path = self.path_resolver.lower_path(&src_info.0);
+        let dest_path = self.path_resolver.upper_path(&src_info.0);
 
         let _src_metadata = match fs::symlink_metadata(&src_path) {
             Ok(m) => m,
@@ -68,13 +65,7 @@ impl TreebeardFs {
                 tracing::debug!(
                     "Source file disappeared during copy-up, checking if already in upper"
                 );
-                let is_in_upper = {
-                    let inodes = self.inodes.read();
-                    inodes
-                        .peek(ino)
-                        .is_some_and(|inode| inode.layer == LayerType::Upper)
-                };
-                if is_in_upper {
+                if self.inode_manager.is_in_upper_layer(ino) {
                     return Ok(());
                 }
                 return Err(libc::ENOENT);
@@ -87,6 +78,7 @@ impl TreebeardFs {
         // Track directories we create so we can clean them up on failure.
         // We only track new directories that didn't exist before copy-up.
         let mut created_dirs: Vec<PathBuf> = Vec::new();
+        let upper_layer = &self.path_resolver.upper_layer;
 
         // Copy-up may occur for files in nested directories. Ensure all parent
         // directories exist in the upper layer before copying the file.
@@ -95,7 +87,7 @@ impl TreebeardFs {
             let mut dirs_to_create: Vec<PathBuf> = Vec::new();
             let mut current = parent_dir.to_path_buf();
 
-            while !current.exists() && current.starts_with(&self.upper_layer) {
+            while !current.exists() && current.starts_with(upper_layer) {
                 dirs_to_create.push(current.clone());
                 if let Some(parent) = current.parent() {
                     current = parent.to_path_buf();
@@ -131,7 +123,7 @@ impl TreebeardFs {
             }
         };
 
-        if src_info.2.kind == FileType::Directory {
+        if src_info.2.kind == fuser::FileType::Directory {
             if let Err(e) = fs::create_dir(&dest_path) {
                 if e.kind() != io::ErrorKind::AlreadyExists {
                     cleanup_on_error(&created_dirs, &dest_path);
@@ -151,16 +143,11 @@ impl TreebeardFs {
             }
         };
 
-        {
-            let mut inodes = self.inodes.write();
-            if let Some(inode) = inodes.get_mut(ino) {
-                inode.layer = LayerType::Upper;
-                inode.path = src_info.0.clone();
-                inode.attrs = metadata_to_fileattr(&new_attrs, ino);
-            }
-        }
+        let file_attrs = metadata_to_fileattr(&new_attrs, ino);
+        self.inode_manager
+            .update_after_copy_up(ino, src_info.0.clone(), file_attrs);
 
-        if src_info.2.kind == FileType::RegularFile {
+        if src_info.2.kind == fuser::FileType::RegularFile {
             self.mutations
                 .write()
                 .insert(src_info.0, MutationType::CopiedUp);
@@ -170,39 +157,15 @@ impl TreebeardFs {
     }
 
     pub(crate) fn copy_up(&mut self, ino: u64) -> Result<u64, i32> {
-        use std::sync::Arc;
-
-        let lock = {
-            let mut locks = self.copy_up_locks.write();
-            locks
-                .entry(ino)
-                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
-                .clone()
-        };
-
+        let lock = self.inode_manager.get_copy_up_lock(ino);
         let _guard = lock.lock();
 
         self.copy_up_internal(ino)?;
 
         // Clean up the lock after successful copy-up
-        self.copy_up_locks.write().remove(&ino);
+        self.inode_manager.remove_copy_up_lock(ino);
 
         Ok(ino)
-    }
-
-    /// Check if a file has been whited-out using AUFS-style `.wh.` prefix files.
-    ///
-    /// For a file at `path`, checks if a whiteout marker exists at `.wh.<filename>`
-    /// in the same directory within the upper layer.
-    pub(crate) fn is_whiteout(&self, path: &Path) -> bool {
-        if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-            let mut whiteout_name = OsString::from(".wh.");
-            whiteout_name.push(name);
-            let whiteout_path = parent.join(whiteout_name);
-            whiteout_path.exists()
-        } else {
-            false
-        }
     }
 
     /// Create a whiteout marker using AUFS-style `.wh.` prefix files.
@@ -215,10 +178,10 @@ impl TreebeardFs {
         name: &std::ffi::OsStr,
     ) -> Result<(), i32> {
         let parent_path = {
-            let inodes = self.inodes.read();
+            let inodes = self.inode_manager.inodes.read();
             let parent_inode = inodes.peek(parent);
             match parent_inode {
-                Some(p) => self.upper_layer.join(&p.path),
+                Some(p) => self.path_resolver.upper_path(&p.path),
                 None => return Err(libc::ENOENT),
             }
         };
@@ -241,10 +204,12 @@ impl TreebeardFs {
 
     pub(crate) fn do_delete(&mut self, ino: u64) {
         let path = {
-            let inodes = self.inodes.read();
+            let inodes = self.inode_manager.inodes.read();
             let inode = inodes.peek(ino);
             match inode {
-                Some(i) if i.layer == LayerType::Upper => Some(self.upper_layer.join(&i.path)),
+                Some(i) if i.layer == LayerType::Upper => {
+                    Some(self.path_resolver.upper_path(&i.path))
+                }
                 _ => None,
             }
         };
@@ -258,10 +223,10 @@ impl TreebeardFs {
 
     pub(crate) fn do_gc(&mut self, ino: u64) {
         let (layer, path) = {
-            let inodes = self.inodes.read();
+            let inodes = self.inode_manager.inodes.read();
             let inode = inodes.peek(ino);
             match inode {
-                Some(i) => (i.layer, self.upper_layer.join(&i.path)),
+                Some(i) => (i.layer, self.path_resolver.upper_path(&i.path)),
                 None => return,
             }
         };
@@ -276,171 +241,7 @@ impl TreebeardFs {
             }
         }
 
-        self.inodes.write().remove(ino);
-    }
-
-    /// Resolve the actual filesystem path for an inode.
-    ///
-    /// This function returns the absolute path where the file actually exists,
-    /// checking upper layer first (overlay semantics: upper shadows lower).
-    ///
-    /// Returns (absolute_path, actual_layer) or None if the file doesn't exist.
-    pub(crate) fn resolve_path(
-        &self,
-        relative_path: &Path,
-        expected_layer: LayerType,
-    ) -> Option<(PathBuf, LayerType)> {
-        if self.is_passthrough(relative_path) {
-            let lower_path = self.lower_layer.join(relative_path);
-            return if lower_path.exists() {
-                Some((lower_path, LayerType::Lower))
-            } else {
-                None
-            };
-        }
-
-        let upper_path = self.upper_layer.join(relative_path);
-        let lower_path = self.lower_layer.join(relative_path);
-
-        tracing::trace!(
-            "resolve_path: relative={:?}, expected_layer={:?}",
-            relative_path,
-            expected_layer
-        );
-        tracing::trace!(
-            "resolve_path: upper={} (exists={}), lower={} (exists={})",
-            upper_path.display(),
-            upper_path.exists(),
-            lower_path.display(),
-            lower_path.exists()
-        );
-
-        // Check for whiteout first
-        if self.is_whiteout(&upper_path) {
-            tracing::trace!("resolve_path: whiteout detected");
-            return None;
-        }
-
-        // Try upper layer first (overlay semantics)
-        if upper_path.exists() {
-            tracing::trace!("resolve_path: found in upper layer");
-            // Canonicalize to resolve symlinks and prevent TOCTOU via symlink replacement
-            match upper_path.canonicalize() {
-                Ok(path) => return Some((path, LayerType::Upper)),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to canonicalize {}: {}, using uncanonicalized path",
-                        upper_path.display(),
-                        e
-                    );
-                    return Some((upper_path, LayerType::Upper));
-                }
-            }
-        }
-
-        // Fall back to lower layer
-        if lower_path.exists() {
-            tracing::trace!("resolve_path: found in lower layer");
-            // Canonicalize to resolve symlinks and prevent TOCTOU via symlink replacement
-            match lower_path.canonicalize() {
-                Ok(path) => return Some((path, LayerType::Lower)),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to canonicalize {}: {}, using uncanonicalized path",
-                        lower_path.display(),
-                        e
-                    );
-                    return Some((lower_path, LayerType::Lower));
-                }
-            }
-        }
-
-        tracing::trace!("resolve_path: file not found in any layer");
-        None
-    }
-
-    /// Returns the base path for a given layer type.
-    ///
-    /// This is a helper to avoid repeated match statements when converting
-    /// LayerType to the corresponding filesystem path.
-    pub(crate) fn layer_base_path(&self, layer: LayerType) -> PathBuf {
-        match layer {
-            LayerType::Upper => self.upper_layer.clone(),
-            LayerType::Lower => self.lower_layer.clone(),
-        }
-    }
-
-    /// Check if a path should bypass the upper layer entirely.
-    ///
-    /// A path is considered passthrough if:
-    /// 1. It directly matches a passthrough pattern (e.g., `.claude/config.toml` matches `.claude/**`)
-    /// 2. It is a parent directory of a passthrough pattern (e.g., `.claude` matches if pattern is `.claude/**`)
-    pub(crate) fn is_passthrough(&self, relative_path: &Path) -> bool {
-        let path_to_match = relative_path.strip_prefix(".").unwrap_or(relative_path);
-        let path_str = path_to_match.to_string_lossy();
-
-        self.passthrough_patterns.iter().any(|p| {
-            // Direct match
-            if p.matches_path(path_to_match) {
-                return true;
-            }
-
-            // Check if this path is a parent/prefix of the pattern.
-            // For example, if pattern is ".claude/**", then ".claude" should also be passthrough.
-            let pattern_str = p.as_str();
-            if let Some(prefix) = pattern_str.strip_suffix("/**") {
-                // Path matches the directory prefix exactly
-                if path_str == prefix {
-                    return true;
-                }
-                // Path is a parent of the prefix (e.g., "foo" when pattern is "foo/bar/**")
-                if prefix.starts_with(&format!("{}/", path_str)) {
-                    return true;
-                }
-            }
-
-            false
-        })
-    }
-
-    /// Get inode information from the inode table.
-    ///
-    /// This is the common lookup pattern used throughout FUSE callbacks.
-    /// Returns `(path, layer, has_open_handles)` if the inode exists, or `None` otherwise.
-    pub(crate) fn get_inode_info(&self, ino: u64) -> Option<(PathBuf, LayerType, bool)> {
-        let inodes = self.inodes.read();
-        inodes
-            .peek(ino)
-            .map(|i| (i.path.clone(), i.layer, i.open_file_handles > 0))
-    }
-
-    /// Creates a new InodeData with the given parameters.
-    ///
-    /// This helper reduces code duplication across FUSE operations that need
-    /// to create new inodes. It handles the common case of calculating the
-    /// hardlink count based on file type (2 for directories, 1 for files).
-    pub(crate) fn create_inode_data(
-        inode: u64,
-        parent: u64,
-        name: OsString,
-        layer: LayerType,
-        path: PathBuf,
-        attrs: FileAttr,
-    ) -> InodeData {
-        InodeData {
-            inode,
-            parent,
-            name,
-            layer,
-            path,
-            attrs,
-            open_file_handles: 0,
-            hardlinks: if attrs.kind == FileType::Directory {
-                2
-            } else {
-                1
-            },
-        }
+        self.inode_manager.remove(ino);
     }
 
     /// Attempt to look up a file via passthrough (lower layer only, ignoring upper layer).
@@ -460,20 +261,20 @@ impl TreebeardFs {
     ) -> Option<Result<(InodeData, FileAttr), i32>> {
         use crate::overlay::convert::{io_error_to_libc, metadata_to_fileattr};
 
-        if !self.is_passthrough(&relative_path) {
+        if !self.path_resolver.is_passthrough(&relative_path) {
             return None;
         }
 
-        let child_lower = self.lower_layer.join(&relative_path);
+        let child_lower = self.path_resolver.lower_path(&relative_path);
         if !child_lower.exists() {
             return Some(Err(libc::ENOENT));
         }
 
         match fs::metadata(&child_lower) {
             Ok(attrs) => {
-                let new_ino = self.alloc_inode();
+                let new_ino = self.inode_manager.alloc_inode();
                 let file_attrs = metadata_to_fileattr(&attrs, new_ino);
-                let inode = Self::create_inode_data(
+                let inode = InodeManager::create_inode_data(
                     new_ino,
                     parent,
                     child_name,
@@ -506,8 +307,8 @@ impl TreebeardFs {
     ) -> Result<Option<(InodeData, FileAttr)>, i32> {
         use crate::overlay::convert::metadata_to_fileattr;
 
-        let child_upper = self.upper_layer.join(&relative_path);
-        let child_lower = self.lower_layer.join(&relative_path);
+        let child_upper = self.path_resolver.upper_path(&relative_path);
+        let child_lower = self.path_resolver.lower_path(&relative_path);
 
         tracing::debug!(
             "lookup_overlay: checking paths - upper={} (exists={}), lower={} (exists={})",
@@ -518,7 +319,7 @@ impl TreebeardFs {
         );
 
         // Check if there's a whiteout in the upper layer (file was deleted)
-        if self.is_whiteout(&child_upper) {
+        if self.path_resolver.is_whiteout(&child_upper) {
             tracing::debug!("lookup_overlay: whiteout found for {:?}", child_name);
             return Ok(None);
         }
@@ -538,7 +339,7 @@ impl TreebeardFs {
                 );
                 match fs::metadata(child_path) {
                     Ok(attrs) => {
-                        let new_ino = self.alloc_inode();
+                        let new_ino = self.inode_manager.alloc_inode();
                         let file_attrs = metadata_to_fileattr(&attrs, new_ino);
                         tracing::debug!(
                             "lookup_overlay: created inode {} for {:?} ({} layer, size={})",
@@ -548,7 +349,7 @@ impl TreebeardFs {
                             file_attrs.size
                         );
 
-                        let inode = Self::create_inode_data(
+                        let inode = InodeManager::create_inode_data(
                             new_ino,
                             parent,
                             child_name,
@@ -585,16 +386,16 @@ impl TreebeardFs {
         ino: u64,
         name: &std::ffi::OsStr,
     ) -> Result<FileAttr, i32> {
-        let inodes = self.inodes.read();
+        let inodes = self.inode_manager.inodes.read();
         if let Some(inode) = inodes.peek(ino) {
             // Passthrough paths ignore whiteouts and upper layer entirely
-            if self.is_passthrough(&inode.path) {
+            if self.path_resolver.is_passthrough(&inode.path) {
                 return Ok(inode.attrs);
             }
 
             // Even for cached inodes, check if a whiteout has been created
-            let upper_path = self.upper_layer.join(&inode.path);
-            if self.is_whiteout(&upper_path) {
+            let upper_path = self.path_resolver.upper_path(&inode.path);
+            if self.path_resolver.is_whiteout(&upper_path) {
                 tracing::debug!(
                     "lookup_check_cached: cached inode {} for {:?} is now whited-out",
                     ino,
@@ -667,7 +468,7 @@ impl TreebeardFs {
 
         // Take a single read lock snapshot for all lookups in this layer
         let existing_children: HashMap<OsString, u64> = {
-            let inodes = self.inodes.read();
+            let inodes = self.inode_manager.inodes.read();
             dir_entries
                 .iter()
                 .filter_map(|entry| {
@@ -720,7 +521,7 @@ impl TreebeardFs {
                     // For upper layer, check if we need to update layer from Lower to Upper
                     if layer == LayerType::Upper {
                         let needs_update = {
-                            let inodes = self.inodes.read();
+                            let inodes = self.inode_manager.inodes.read();
                             inodes
                                 .peek(existing_ino)
                                 .is_some_and(|inode| inode.layer == LayerType::Lower)
@@ -742,11 +543,11 @@ impl TreebeardFs {
                         Err(_) => continue,
                     };
 
-                    let new_ino = self.alloc_inode();
+                    let new_ino = self.inode_manager.alloc_inode();
                     let file_attrs = metadata_to_fileattr(&metadata, new_ino);
                     let relative_path = dir_path.join(&name);
 
-                    let inode = Self::create_inode_data(
+                    let inode = InodeManager::create_inode_data(
                         new_ino,
                         parent_ino,
                         name.clone(),
@@ -775,10 +576,7 @@ impl TreebeardFs {
     {
         use crate::overlay::convert::io_error_to_libc;
 
-        let lookup_result = {
-            let inodes = self.inodes.read();
-            inodes.lookup_child(parent, name)
-        };
+        let lookup_result = self.inode_manager.lookup_child(parent, name);
         let ino = match lookup_result {
             Some(ino) => ino,
             None => {
@@ -787,24 +585,19 @@ impl TreebeardFs {
             }
         };
 
-        let Some((path, layer, has_open)) = self.get_inode_info(ino) else {
+        let Some((path, layer, has_open)) = self.inode_manager.get_inode_info(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let is_passthrough = self.is_passthrough(&path);
+        let is_passthrough = self.path_resolver.is_passthrough(&path);
 
-        {
-            let mut inodes = self.inodes.write();
-            inodes.remove_child(parent, name);
-            if let Some(inode) = inodes.get_mut(ino) {
-                inode.hardlinks = inode.hardlinks.saturating_sub(1);
-                inode.attrs.nlink = inode.attrs.nlink.saturating_sub(1);
-            }
-        }
+        // Update inode state
+        self.inode_manager.remove_child(parent, name);
+        self.inode_manager.decrement_hardlinks(ino);
 
         if is_passthrough {
-            let lower_path = self.lower_layer.join(&path);
+            let lower_path = self.path_resolver.lower_path(&path);
             if let Err(e) = remove_fn(lower_path) {
                 reply.error(io_error_to_libc(&e));
                 return;
@@ -813,7 +606,7 @@ impl TreebeardFs {
             match layer {
                 LayerType::Upper => {
                     if has_open {
-                        self.deleted.write().insert(ino);
+                        self.inode_manager.mark_deleted(ino);
                     } else {
                         self.do_delete(ino);
                     }
