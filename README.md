@@ -532,4 +532,4 @@ FUSE_TESTS=REAL cargo nextest run --test fuse_real_tests -- --ignored
 
 ## License
 
-[Your license here]
+[MIT](./LICENSE)
