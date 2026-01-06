@@ -9,6 +9,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
+MAIN_REPO="divmain/treebeard"
 HOMEBREW_TAP_REPO="divmain/homebrew-treebeard"
 TARGET="aarch64-apple-darwin"
 BINARY_NAME="treebeard"
@@ -180,6 +181,7 @@ create_main_release() {
     
     info "Creating GitHub release on treebeard repo..."
     gh release create "v$version" \
+        --repo "$MAIN_REPO" \
         --title "v$version" \
         --generate-notes
     
