@@ -33,6 +33,13 @@ brew install --cask macfuse
 
 After installing macFUSE, you'll need to approve the kernel extension in System Settings → Privacy & Security.
 
+### Homebrew (recommended)
+
+```bash
+brew tap divmain/treebeard
+brew install treebeard
+```
+
 ### Build from source
 
 ```bash
